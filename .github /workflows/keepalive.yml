@@ -28,7 +28,7 @@ jobs:
 
       - name: Abrir Streamlit e manter ativo
         env:
-          APP_URL: "https://app-winning-wars-jwjuzibnwyejvqmcwyvge8.streamlit.app/"
+          APP_URL: "XXXXXXXXXXXX"
         run: |
           python <<EOF
           import os
