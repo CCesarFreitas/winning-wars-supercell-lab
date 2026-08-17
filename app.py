@@ -34,6 +34,41 @@ st.set_page_config(
     page_title="Winning Wars APP", page_icon=str(Path(__file__).parent / "static" / "favicon.png"), layout="wide"
 )
 
+# --- AVISO FIXO DE AMBIENTE DE HOMOLOGAÇÃO ---
+st.markdown(
+    """
+    <div style="
+        width: 100%;
+        margin: 0 0 18px 0;
+        padding: 14px 18px;
+        border-radius: 14px;
+        border: 2px solid #facc15;
+        background: linear-gradient(90deg, #7f1d1d 0%, #b91c1c 45%, #7f1d1d 100%);
+        box-shadow: 0 0 22px rgba(250, 204, 21, 0.35);
+        text-align: center;
+        color: #ffffff;
+        font-family: 'Nunito', sans-serif;
+        font-size: 1.25rem;
+        font-weight: 900;
+        letter-spacing: 0.8px;
+        text-transform: uppercase;
+    ">
+        🚧 AMBIENTE DE HOMOLOGAÇÃO 🚧
+        <div style="
+            margin-top: 4px;
+            font-size: 0.86rem;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-transform: none;
+            color: #fef3c7;
+        ">
+            Área exclusiva para testes — não utilizar como ambiente oficial.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 # --- PWA / ÍCONE PARA IPHONE, IPAD E ANDROID ---
 # O favicon continua configurado em st.set_page_config.
 # Para instalação na Tela de Início, reforçamos apple-touch-icon,
