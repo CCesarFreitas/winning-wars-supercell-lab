@@ -371,7 +371,6 @@ def conectar_banco():
 
 spreadsheet = client.open_by_key("1c04hDmNlnFglam9vZ_v77BzYIUK6rbuljIdK8TEhi3A")
 sheet_dados = spreadsheet.sheet1
-
   # Aba de Admins
   try:
     sheet_admins = spreadsheet.worksheet("Admins")
