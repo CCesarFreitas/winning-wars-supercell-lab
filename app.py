@@ -379,15 +379,13 @@ def conectar_banco():
 
     # 2. Carrega as credenciais
     try:
-        creds_dict = json.loads(
-            st.secrets["gcp_service_account"]
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Não foi possível interpretar o JSON de 'gcp_service_account': "
-            f"{type(exc).__name__}"
-        ) from exc
+    creds_dict = dict(st.secrets["gcp_service_account"])
 
+except Exception as exc:
+    raise RuntimeError(
+        f"Não foi possível carregar 'gcp_service_account': "
+        f"{type(exc).__name__}: {exc}"
+    ) from exc
     # 3. Confere se é a Service Account esperada
     client_email = str(
         creds_dict.get("client_email", "")
