@@ -378,7 +378,8 @@ def conectar_banco():
         )
 
     # 2. Carrega as credenciais
-    try:
+    # 2. Carrega as credenciais
+try:
     creds_dict = dict(st.secrets["gcp_service_account"])
 
 except Exception as exc:
@@ -386,15 +387,17 @@ except Exception as exc:
         f"Não foi possível carregar 'gcp_service_account': "
         f"{type(exc).__name__}: {exc}"
     ) from exc
-    # 3. Confere se é a Service Account esperada
-    client_email = str(
-        creds_dict.get("client_email", "")
-    ).strip()
 
-    if not client_email:
-        raise RuntimeError(
-            "O JSON da Service Account não possui 'client_email'."
-        )
+
+# 3. Confere o client_email
+client_email = str(
+    creds_dict.get("client_email", "")
+).strip()
+
+if not client_email:
+    raise RuntimeError(
+        "As credenciais não possuem 'client_email'."
+    )
 
     # 4. Escopos Google
     scope = [
