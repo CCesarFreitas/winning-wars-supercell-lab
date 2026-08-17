@@ -16,13 +16,6 @@ from pathlib import Path
 import streamlit.components.v1 as components
 from oauth2client.service_account import ServiceAccountCredentials
 
-st.write("CHAVES DOS SECRETS:", list(st.secrets.keys()))
-st.write(
-    "google_spreadsheet_id:",
-    repr(st.secrets.get("google_spreadsheet_id", None))
-)
-st.stop()
-
 try:
   from PIL import Image, ImageOps
   PILLOW_DISPONIVEL = True
