@@ -361,8 +361,6 @@ def resolver_imagem_upload(arquivo, url_manual: str, pasta: str) -> tuple[str, s
 # --- CONEXÃO COM O GOOGLE SHEETS ---
 @st.cache_resource
 def conectar_banco():
-
-    # 1. Verifica se os Secrets obrigatórios existem
     spreadsheet_id = str(
         st.secrets.get("google_spreadsheet_id", "")
     ).strip()
@@ -377,58 +375,42 @@ def conectar_banco():
             "O Secret 'gcp_service_account' não foi configurado no Streamlit."
         )
 
-    # 2. Carrega as credenciais
-    # 2. Carrega as credenciais
-try:
-    creds_dict = dict(st.secrets["gcp_service_account"])
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"Não foi possível carregar 'gcp_service_account': "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-except Exception as exc:
-    raise RuntimeError(
-        f"Não foi possível carregar 'gcp_service_account': "
-        f"{type(exc).__name__}: {exc}"
-    ) from exc
+    client_email = str(
+        creds_dict.get("client_email", "")
+    ).strip()
 
+    if not client_email:
+        raise RuntimeError(
+            "As credenciais não possuem 'client_email'."
+        )
 
-# 3. Confere o client_email
-client_email = str(
-    creds_dict.get("client_email", "")
-).strip()
-
-if not client_email:
-    raise RuntimeError(
-        "As credenciais não possuem 'client_email'."
-    )
-
-    # 4. Escopos Google
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # 5. Autenticação
     try:
-        credentials = (
-            ServiceAccountCredentials
-            .from_json_keyfile_dict(
-                creds_dict,
-                scope
-            )
+        credentials = ServiceAccountCredentials.from_json_keyfile_dict(
+            creds_dict,
+            scope,
         )
-
         client = gspread.authorize(credentials)
-
     except Exception as exc:
         raise RuntimeError(
             f"Falha ao autenticar a Service Account "
             f"'{client_email}': {type(exc).__name__}: {exc}"
         ) from exc
 
-    # 6. Abre exatamente a planilha de homologação pelo ID
     try:
-        spreadsheet = client.open_by_key(
-            spreadsheet_id
-        )
-
+        spreadsheet = client.open_by_key(spreadsheet_id)
     except gspread.exceptions.SpreadsheetNotFound as exc:
         raise RuntimeError(
             "A planilha não foi encontrada ou a Service Account "
@@ -436,283 +418,122 @@ if not client_email:
             f"Spreadsheet ID: {spreadsheet_id}\n"
             f"Service Account: {client_email}"
         ) from exc
-
     except gspread.exceptions.APIError as exc:
         raise RuntimeError(
             f"O Google retornou um erro de API ao abrir a planilha: {exc}"
         ) from exc
 
-    # Primeira aba = banco principal
     sheet_dados = spreadsheet.sheet1
 
-
-    # --- ABA ADMINS ---
     try:
         sheet_admins = spreadsheet.worksheet("Admins")
-
     except gspread.WorksheetNotFound:
-
         if not SENHA_ADMIN_INICIAL:
             raise RuntimeError(
                 "A aba 'Admins' não existe e o Secret "
                 "'admin_default_password' não foi configurado."
             )
-
         sheet_admins = spreadsheet.add_worksheet(
-            title="Admins",
-            rows="100",
-            cols="3"
+            title="Admins", rows="100", cols="3"
         )
-
+        sheet_admins.append_row(["Usuario", "SenhaHash", "Nivel"])
         sheet_admins.append_row(
-            ["Usuario", "SenhaHash", "Nivel"]
+            ["admin", gerar_hash_seguro(SENHA_ADMIN_INICIAL), "Dono"]
         )
 
-        sheet_admins.append_row(
-            [
-                "admin",
-                gerar_hash_seguro(SENHA_ADMIN_INICIAL),
-                "Dono"
-            ]
-        )
-
-
-    # --- ABA ESTADO ---
     try:
-        sheet_estado = spreadsheet.worksheet(
-            "EstadoMes"
-        )
-
+        sheet_estado = spreadsheet.worksheet("EstadoMes")
     except gspread.WorksheetNotFound:
-
         sheet_estado = spreadsheet.add_worksheet(
-            title="EstadoMes",
-            rows="10",
-            cols="2"
+            title="EstadoMes", rows="10", cols="2"
         )
+        sheet_estado.append_row(["Chave", "Valor"])
+        sheet_estado.append_row(["mes_finalizado", "FALSE"])
+        sheet_estado.append_row([
+            "mural_recado",
+            "Bem-vindos ao aplicativo oficial do clã Winning Wars!"
+        ])
 
-        sheet_estado.append_row(
-            ["Chave", "Valor"]
-        )
-
-        sheet_estado.append_row(
-            ["mes_finalizado", "FALSE"]
-        )
-
-        sheet_estado.append_row(
-            [
-                "mural_recado",
-                "Bem-vindos ao aplicativo oficial do clã Winning Wars!"
-            ]
-        )
-
-
-    # --- ABA LAYOUTS ---
     try:
-        sheet_layouts = spreadsheet.worksheet(
-            "Layouts"
-        )
-
+        sheet_layouts = spreadsheet.worksheet("Layouts")
     except gspread.WorksheetNotFound:
-
         sheet_layouts = spreadsheet.add_worksheet(
-            title="Layouts",
-            rows="500",
-            cols="8"
+            title="Layouts", rows="500", cols="8"
         )
+        sheet_layouts.append_row([
+            "Tipo", "CV", "Autor", "Link", "Descricao",
+            "ImagemUrl", "DataHora", "Tag"
+        ])
 
-        sheet_layouts.append_row(
-            [
-                "Tipo",
-                "CV",
-                "Autor",
-                "Link",
-                "Descricao",
-                "ImagemUrl",
-                "DataHora",
-                "Tag"
-            ]
-        )
-
-
-    # --- ABA LOGS ---
     try:
         sheet_logs = spreadsheet.worksheet("Logs")
-
     except gspread.WorksheetNotFound:
-
         sheet_logs = spreadsheet.add_worksheet(
-            title="Logs",
-            rows="1000",
-            cols="3"
+            title="Logs", rows="1000", cols="3"
         )
+        sheet_logs.append_row(["DataHora", "Admin", "Acao"])
 
-        sheet_logs.append_row(
-            ["DataHora", "Admin", "Acao"]
-        )
-
-
-    # --- GALERIA DA FAMA ---
     try:
-        sheet_fama = spreadsheet.worksheet(
-            "GaleriaFama"
-        )
-
+        sheet_fama = spreadsheet.worksheet("GaleriaFama")
     except gspread.WorksheetNotFound:
-
         sheet_fama = spreadsheet.add_worksheet(
-            title="GaleriaFama",
-            rows="100",
-            cols="4"
+            title="GaleriaFama", rows="100", cols="4"
         )
+        sheet_fama.append_row(["MesAno", "Primeiro", "Segundo", "Terceiro"])
 
-        sheet_fama.append_row(
-            [
-                "MesAno",
-                "Primeiro",
-                "Segundo",
-                "Terceiro"
-            ]
-        )
-
-
-    # --- NOVIDADES ---
     try:
-        sheet_novidades = spreadsheet.worksheet(
-            "Novidades"
-        )
-
+        sheet_novidades = spreadsheet.worksheet("Novidades")
     except gspread.WorksheetNotFound:
-
         sheet_novidades = spreadsheet.add_worksheet(
-            title="Novidades",
-            rows="200",
-            cols="10"
+            title="Novidades", rows="200", cols="10"
         )
+        sheet_novidades.append_row([
+            "DataHora", "Titulo", "Conteudo", "ImagemUrl", "Tag", "Autor",
+            "Fixada", "ExpiraEm", "Status", "LinkBotao"
+        ])
 
-        sheet_novidades.append_row(
-            [
-                "DataHora",
-                "Titulo",
-                "Conteudo",
-                "ImagemUrl",
-                "Tag",
-                "Autor",
-                "Fixada",
-                "ExpiraEm",
-                "Status",
-                "LinkBotao"
-            ]
-        )
-
-
-    # --- HISTÓRICO ---
     try:
-        sheet_historico = spreadsheet.worksheet(
-            "Historico"
-        )
-
+        sheet_historico = spreadsheet.worksheet("Historico")
     except gspread.WorksheetNotFound:
-
         sheet_historico = spreadsheet.add_worksheet(
-            title="Historico",
-            rows="3000",
-            cols="7"
+            title="Historico", rows="3000", cols="7"
         )
+        sheet_historico.append_row([
+            "DataHora", "Temporada", "Jogador", "Pontos",
+            "Posicao", "Tipo", "Detalhe"
+        ])
 
-        sheet_historico.append_row(
-            [
-                "DataHora",
-                "Temporada",
-                "Jogador",
-                "Pontos",
-                "Posicao",
-                "Tipo",
-                "Detalhe"
-            ]
-        )
-
-
-    # --- EVENTOS ---
     try:
-        sheet_eventos = spreadsheet.worksheet(
-            "EventosCla"
-        )
-
+        sheet_eventos = spreadsheet.worksheet("EventosCla")
     except gspread.WorksheetNotFound:
-
         sheet_eventos = spreadsheet.add_worksheet(
-            title="EventosCla",
-            rows="500",
-            cols="7"
+            title="EventosCla", rows="500", cols="7"
         )
+        sheet_eventos.append_row([
+            "ID", "Data", "Tipo", "Titulo", "Descricao", "Status", "Autor"
+        ])
 
-        sheet_eventos.append_row(
-            [
-                "ID",
-                "Data",
-                "Tipo",
-                "Titulo",
-                "Descricao",
-                "Status",
-                "Autor"
-            ]
-        )
-
-
-    # --- AUDITORIA ---
     try:
-        sheet_auditoria = spreadsheet.worksheet(
-            "AuditoriaPontos"
-        )
-
+        sheet_auditoria = spreadsheet.worksheet("AuditoriaPontos")
     except gspread.WorksheetNotFound:
-
         sheet_auditoria = spreadsheet.add_worksheet(
-            title="AuditoriaPontos",
-            rows="5000",
-            cols="7"
+            title="AuditoriaPontos", rows="5000", cols="7"
         )
+        sheet_auditoria.append_row([
+            "DataHora", "Admin", "Jogador", "Atividade",
+            "Antes", "Depois", "Motivo"
+        ])
 
-        sheet_auditoria.append_row(
-            [
-                "DataHora",
-                "Admin",
-                "Jogador",
-                "Atividade",
-                "Antes",
-                "Depois",
-                "Motivo"
-            ]
-        )
-
-
-    # --- BACKUPS ---
     try:
-        sheet_backups = spreadsheet.worksheet(
-            "BackupsSeguranca"
-        )
-
+        sheet_backups = spreadsheet.worksheet("BackupsSeguranca")
     except gspread.WorksheetNotFound:
-
         sheet_backups = spreadsheet.add_worksheet(
-            title="BackupsSeguranca",
-            rows="5000",
-            cols="7"
+            title="BackupsSeguranca", rows="5000", cols="7"
         )
-
-        sheet_backups.append_row(
-            [
-                "BackupID",
-                "DataHora",
-                "Admin",
-                "Acao",
-                "Aba",
-                "Parte",
-                "ConteudoJSON"
-            ]
-        )
-
+        sheet_backups.append_row([
+            "BackupID", "DataHora", "Admin", "Acao",
+            "Aba", "Parte", "ConteudoJSON"
+        ])
 
     return (
         sheet_dados,
@@ -729,12 +550,7 @@ if not client_email:
     )
 
 
-# ==========================================================
-# INICIALIZAÇÃO DA CONEXÃO
-# ==========================================================
-
 try:
-
     (
         sheet_dados,
         sheet_admins,
@@ -750,15 +566,8 @@ try:
     ) = conectar_banco()
 
 except Exception as e:
-
-    st.error(
-        "⚠️ **Erro na conexão com o banco de homologação.**"
-    )
-
-    # HOMOLOGAÇÃO:
-    # mostra o erro real para facilitar o diagnóstico.
+    st.error("⚠️ **Erro na conexão com o banco de homologação.**")
     st.exception(e)
-
     st.stop()
 
 
