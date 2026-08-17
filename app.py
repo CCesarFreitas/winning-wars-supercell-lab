@@ -369,8 +369,8 @@ def conectar_banco():
   creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
   client = gspread.authorize(creds)
 
-  spreadsheet = client.open("WinningWars_DB")
-  sheet_dados = spreadsheet.sheet1
+spreadsheet = client.open_by_key("1c04hDmNlnFglam9vZ_v77BzYIUK6rbuljIdK8TEhi3A")
+sheet_dados = spreadsheet.sheet1
 
   # Aba de Admins
   try:
