@@ -1,1 +1,53 @@
+name: Streamlit Keep Alive
 
+on:
+  schedule:
+    # Executa a cada 6 horas
+    - cron: "0 */6 * * *"
+
+  # Permite executar manualmente pelo GitHub
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Abrir Streamlit e manter ativo
+        env:
+          APP_URL: "https://app-winning-wars-jwjuzibnwyejvqmcwyvge8.streamlit.app/"
+        run: |
+          python <<EOF
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+
+              print("Abrindo:", url)
+
+              page.goto(url, wait_until="networkidle", timeout=60000)
+
+              # Mantém alguns segundos para o Streamlit registrar a visita
+              page.wait_for_timeout(30000)
+
+              print("App acessado com sucesso")
+
+              browser.close()
+          EOF
