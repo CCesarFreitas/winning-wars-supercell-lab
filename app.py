@@ -24,7 +24,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v45 - otimização global de acesso ao Google Sheets, cache seletivo e proteção de quota.
+# Winning Wars v46 HOMOLOGAÇÃO - base v45 + conexão exclusiva por ID ao banco de testes.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -369,8 +369,24 @@ def conectar_banco():
   creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
   client = gspread.authorize(creds)
 
-spreadsheet = client.open_by_key("1c04hDmNlnFglam9vZ_v77BzYIUK6rbuljIdK8TEhi3A")
-sheet_dados = spreadsheet.sheet1
+  # HOMOLOGAÇÃO: conexão exclusiva com a planilha definida por ID.
+  # Isso impede que o ambiente de testes abra por engano outra planilha
+  # com o mesmo nome do banco de produção.
+  spreadsheet_id = str(
+      st.secrets.get(
+          "google_spreadsheet_id",
+          "1c04hDmNlnFglam9vZ_v77BzYIUK6rbuljIdK8TEhi3A",
+      )
+  ).strip()
+
+  if not spreadsheet_id:
+    raise RuntimeError(
+        "O secret 'google_spreadsheet_id' não foi configurado."
+    )
+
+  spreadsheet = client.open_by_key(spreadsheet_id)
+  sheet_dados = spreadsheet.sheet1
+
   # Aba de Admins
   try:
     sheet_admins = spreadsheet.worksheet("Admins")
@@ -533,8 +549,8 @@ try:
   ) = conectar_banco()
 except Exception:
   st.error(
-      "⚠️ **Erro na Conexão:** Não foi possível acessar a planilha"
-      " 'WinningWars_DB'. Verifique suas permissões."
+      "⚠️ **Erro na Conexão:** Não foi possível acessar a planilha de homologação. "
+      "Verifique o google_spreadsheet_id e as permissões da conta de serviço."
   )
   st.stop()
 
