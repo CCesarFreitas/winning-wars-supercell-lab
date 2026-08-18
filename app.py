@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v53.2 HOMOLOGAÇÃO - correção da pontuação dos Raides: 1 ponto por ataque + bônus Top 3.
+# Winning Wars v55 HOMOLOGAÇÃO - Jogos do Clã otimizado: elegíveis, lote por PlayerTag, backup e anti-duplicidade.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -582,6 +582,17 @@ def conectar_banco():
             "StatusNovo", "ClaAnterior", "ClaNovo", "Detalhe"
         ])
 
+    try:
+        sheet_jogos_cla_lancamentos = spreadsheet.worksheet("JogosClaLancamentos")
+    except gspread.WorksheetNotFound:
+        sheet_jogos_cla_lancamentos = spreadsheet.add_worksheet(
+            title="JogosClaLancamentos", rows="5000", cols="10"
+        )
+        sheet_jogos_cla_lancamentos.append_row([
+            "JogosClaID", "Edicao", "DataHora", "Admin", "PlayerTag",
+            "Nome", "PontosJogos", "PontosPasse", "StatusJogos", "Aplicado"
+        ])
+
     return (
         sheet_dados,
         sheet_admins,
@@ -595,6 +606,7 @@ def conectar_banco():
         sheet_auditoria,
         sheet_backups,
         sheet_movimentacoes_supercell,
+        sheet_jogos_cla_lancamentos,
     )
 
 
@@ -612,6 +624,7 @@ try:
         sheet_auditoria,
         sheet_backups,
         sheet_movimentacoes_supercell,
+        sheet_jogos_cla_lancamentos,
     ) = conectar_banco()
 
 except Exception as e:
@@ -3304,7 +3317,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v53)
+# SUPERCELL API - HOMOLOGAÇÃO (v55)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -4782,6 +4795,579 @@ def renderizar_previa_raides_v53():
   )
 
 
+
+def calcular_pontos_jogos_cla_v55(pontos_jogos):
+  try:
+    pontos = max(0, int(float(pontos_jogos)))
+  except Exception:
+    pontos = 0
+
+  if pontos >= 10000:
+    return 10, "🏆 Meta máxima"
+  if pontos >= 4000:
+    return 8, "✅ Boa participação"
+  if pontos >= 2000:
+    return 5, "✅ Participação válida"
+  if pontos >= 1:
+    return 0, "⚠️ Sanguessuga"
+  return 0, "⛔ Não participou"
+
+
+def _jogos_cla_id_v55(ano, mes):
+  ano = int(ano)
+  mes = int(mes)
+  if mes < 1 or mes > 12:
+    raise ValueError("Mês inválido para os Jogos do Clã.")
+  return f"{ano:04d}-{mes:02d}"
+
+
+def _jogos_cla_rotulo_v55(ano, mes):
+  meses = [
+      "Janeiro", "Fevereiro", "Março", "Abril",
+      "Maio", "Junho", "Julho", "Agosto",
+      "Setembro", "Outubro", "Novembro", "Dezembro",
+  ]
+  return f"Jogos do Clã — {meses[int(mes)-1]}/{int(ano)}"
+
+
+def _jogos_cla_base_elegiveis_v55():
+  """Somente membros atualmente elegíveis para a competição do Passe."""
+  try:
+    registros = obter_dados_cached()
+  except Exception:
+    registros = []
+
+  linhas = []
+  for registro in registros or []:
+    tag = _supercell_normalizar_tag(registro.get("PlayerTag", ""))
+    if not tag:
+      continue
+
+    elegivel = str(registro.get("ElegivelPasse", "") or "").strip().upper()
+    status = str(registro.get("StatusClan", "") or "").strip()
+
+    if elegivel != "SIM" or status != "Principal":
+      continue
+
+    linhas.append({
+        "Nome": str(registro.get("Nome", "") or "").strip(),
+        "PlayerTag": tag,
+        "Pontos Jogos": 0,
+    })
+
+  df_base = pd.DataFrame(linhas)
+  if not df_base.empty:
+    df_base = df_base.sort_values("Nome", key=lambda s: s.astype(str).str.casefold()).reset_index(drop=True)
+  return df_base
+
+
+def _parse_lista_jogos_v55(texto):
+  """Aceita linhas como '#TAG 10000', '#TAG;10000' ou '#TAG:10000'."""
+  resultado = {}
+  erros = []
+
+  for numero, linha in enumerate(str(texto or "").splitlines(), start=1):
+    bruto = linha.strip()
+    if not bruto:
+      continue
+
+    normalizado = bruto.replace(";", " ").replace(":", " ").replace(",", " ")
+    partes = [p for p in normalizado.split() if p]
+
+    if len(partes) < 2:
+      erros.append(f"Linha {numero}: formato inválido — {bruto}")
+      continue
+
+    tag = _supercell_normalizar_tag(partes[0])
+    valor_txt = partes[-1].replace(".", "")
+
+    try:
+      pontos = max(0, int(valor_txt))
+    except Exception:
+      erros.append(f"Linha {numero}: pontuação inválida — {bruto}")
+      continue
+
+    if not tag:
+      erros.append(f"Linha {numero}: PlayerTag inválida — {bruto}")
+      continue
+
+    resultado[tag] = pontos
+
+  return resultado, erros
+
+
+def _jogos_cla_ids_salvos_v55():
+  try:
+    valores = sheet_jogos_cla_lancamentos.get_all_values()
+  except Exception:
+    return set()
+
+  if len(valores) < 2:
+    return set()
+
+  headers = valores[0]
+  if "JogosClaID" not in headers:
+    return set()
+
+  idx = headers.index("JogosClaID")
+  ids = set()
+  for linha in valores[1:]:
+    if idx < len(linha):
+      valor = str(linha[idx] or "").strip()
+      if valor:
+        ids.add(valor)
+  return ids
+
+
+def montar_previa_jogos_cla_v55(df_lancamentos, ano, mes):
+  if df_lancamentos is None or df_lancamentos.empty:
+    return pd.DataFrame(), {}
+
+  jogos_id = _jogos_cla_id_v55(ano, mes)
+  rotulo = _jogos_cla_rotulo_v55(ano, mes)
+
+  linhas = []
+  for _, row in df_lancamentos.iterrows():
+    tag = _supercell_normalizar_tag(row.get("PlayerTag", ""))
+    nome = str(row.get("Nome", "") or "").strip()
+
+    try:
+      pontos_brutos = max(0, int(float(row.get("Pontos Jogos", 0) or 0)))
+    except Exception:
+      pontos_brutos = 0
+
+    pontos_passe, status = calcular_pontos_jogos_cla_v55(pontos_brutos)
+
+    linhas.append({
+        "JogosClaID": jogos_id,
+        "Edição": rotulo,
+        "PlayerTag": tag,
+        "Jogador": nome,
+        "Pontos Jogos": pontos_brutos,
+        "Pontos Passe": pontos_passe,
+        "Status Jogos": status,
+    })
+
+  previa = pd.DataFrame(linhas)
+  if not previa.empty:
+    previa = previa.sort_values(
+        ["Pontos Passe", "Pontos Jogos", "Jogador"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+  meta = {
+      "JogosClaID": jogos_id,
+      "Edição": rotulo,
+      "Elegiveis": len(previa),
+      "Participaram": int((previa["Pontos Jogos"] > 0).sum()),
+      "Sanguessugas": int(previa["Status Jogos"].astype(str).str.startswith("⚠️").sum()),
+      "NaoParticiparam": int(previa["Status Jogos"].astype(str).str.startswith("⛔").sum()),
+      "MetaMaxima": int(previa["Status Jogos"].astype(str).str.startswith("🏆").sum()),
+      "TotalPontosPasse": int(pd.to_numeric(previa["Pontos Passe"], errors="coerce").fillna(0).sum()),
+  }
+  return previa, meta
+
+
+def gravar_jogos_cla_v55(previa, meta):
+  """Grava toda a edição em lote usando PlayerTag e bloqueio por JogosClaID."""
+  if previa is None or previa.empty:
+    raise RuntimeError("Não há prévia dos Jogos do Clã para salvar.")
+
+  jogos_id = str(meta.get("JogosClaID", "") or "").strip()
+  edicao = str(meta.get("Edição", "") or "").strip()
+
+  if not jogos_id:
+    raise RuntimeError("JogosClaID inválido.")
+
+  if jogos_id in _jogos_cla_ids_salvos_v55():
+    raise RuntimeError(
+        f"A edição {jogos_id} já foi lançada. O bloqueio de duplicidade impediu novo lançamento."
+    )
+
+  valores = sheet_dados.get_all_values()
+  if not valores:
+    raise RuntimeError("A planilha principal está vazia.")
+
+  headers = valores[0]
+  if "PlayerTag" not in headers:
+    raise RuntimeError("A coluna PlayerTag não existe na planilha principal.")
+  if "JogosCla" not in headers:
+    raise RuntimeError("A coluna JogosCla não existe na planilha principal.")
+
+  idx_tag = headers.index("PlayerTag")
+  idx_jogos = headers.index("JogosCla")
+  idx_nome = headers.index("Nome") if "Nome" in headers else None
+
+  # Índice físico por PlayerTag.
+  linha_por_tag = {}
+  atual_por_tag = {}
+  nome_por_tag = {}
+
+  for numero_linha, linha in enumerate(valores[1:], start=2):
+    tag = _supercell_normalizar_tag(linha[idx_tag] if idx_tag < len(linha) else "")
+    if not tag:
+      continue
+
+    linha_por_tag[tag] = numero_linha
+
+    atual = linha[idx_jogos] if idx_jogos < len(linha) else 0
+    try:
+      atual_por_tag[tag] = int(float(atual or 0))
+    except Exception:
+      atual_por_tag[tag] = 0
+
+    if idx_nome is not None:
+      nome_por_tag[tag] = str(linha[idx_nome] if idx_nome < len(linha) else "").strip()
+
+  # Backup obrigatório antes de qualquer escrita.
+  exigir_backup_automatico(
+      f"Jogos do Clã {jogos_id} - lançamento definitivo",
+      [
+          ("DadosPlayers", sheet_dados),
+          ("JogosClaLancamentos", sheet_jogos_cla_lancamentos),
+      ],
+  )
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  admin = st.session_state.get("admin_logado", "sistema")
+
+  atualizacoes = []
+  auditorias = []
+  historico_edicao = []
+  nao_encontrados = []
+
+  for _, row in previa.iterrows():
+    tag = _supercell_normalizar_tag(row.get("PlayerTag", ""))
+    if not tag:
+      continue
+
+    numero_linha = linha_por_tag.get(tag)
+    if not numero_linha:
+      nao_encontrados.append(tag)
+      continue
+
+    pontos_passe = int(row.get("Pontos Passe", 0) or 0)
+    pontos_jogos = int(row.get("Pontos Jogos", 0) or 0)
+    antes = int(atual_por_tag.get(tag, 0))
+    nome = str(row.get("Jogador", "") or nome_por_tag.get(tag, "")).strip()
+    status = str(row.get("Status Jogos", "") or "").strip()
+
+    celula = gspread.utils.rowcol_to_a1(numero_linha, idx_jogos + 1)
+    atualizacoes.append({
+        "range": celula,
+        "values": [[pontos_passe]],
+    })
+
+    if antes != pontos_passe:
+      auditorias.append([
+          agora,
+          admin,
+          nome,
+          "JogosCla",
+          antes,
+          pontos_passe,
+          f"{edicao} | bruto={pontos_jogos} | {status} | PlayerTag={tag}",
+      ])
+
+    historico_edicao.append([
+        jogos_id,
+        edicao,
+        agora,
+        admin,
+        tag,
+        nome,
+        pontos_jogos,
+        pontos_passe,
+        status,
+        "SIM",
+    ])
+
+  if not atualizacoes:
+    raise RuntimeError("Nenhum PlayerTag da prévia foi localizado na planilha principal.")
+
+  # Gravação principal em uma única chamada.
+  sheet_dados.batch_update(
+      atualizacoes,
+      value_input_option="USER_ENTERED",
+  )
+
+  # Registra a edição em lote; é este histórico que impede duplicidade.
+  if historico_edicao:
+    sheet_jogos_cla_lancamentos.append_rows(
+        historico_edicao,
+        value_input_option="USER_ENTERED",
+    )
+
+  if auditorias:
+    sheet_auditoria.append_rows(
+        auditorias,
+        value_input_option="USER_ENTERED",
+    )
+
+  try:
+    sheet_logs.append_row([
+        agora,
+        admin,
+        (
+            f"Jogos do Clã {jogos_id}: {len(atualizacoes)} players lançados em lote; "
+            f"{len(auditorias)} pontuações alteradas"
+        ),
+    ])
+  except Exception:
+    pass
+
+  obter_dados_cached.clear()
+  try:
+    obter_auditoria_cached.clear()
+  except Exception:
+    pass
+  try:
+    obter_logs_cached.clear()
+  except Exception:
+    pass
+
+  snapshot_ranking_atual("alteracao", f"Lançamento Jogos do Clã {jogos_id}")
+
+  return {
+      "aplicados": len(atualizacoes),
+      "alterados": len(auditorias),
+      "nao_encontrados": nao_encontrados,
+  }
+
+
+def renderizar_jogos_cla_v55():
+  st.markdown("#### 6️⃣ Jogos do Clã — lançamento otimizado")
+  st.info(
+      "Somente membros atualmente elegíveis ao Passe aparecem nesta tela. "
+      "O lançamento usa **PlayerTag**, calcula automaticamente a regra 0/5/8/10 "
+      "e salva toda a edição em lote."
+  )
+
+  st.markdown(
+      "**Regra oficial do Winning Wars:** "
+      "`0 = não participou` · `1–1.999 = ⚠️ sanguessuga / 0 pt` · "
+      "`2.000–3.999 = 5 pts` · `4.000–9.999 = 8 pts` · `10.000+ = 10 pts`"
+  )
+
+  hoje = datetime.now()
+  c1, c2 = st.columns(2)
+  with c1:
+    ano = st.number_input(
+        "Ano da edição",
+        min_value=2020,
+        max_value=2100,
+        value=int(hoje.year),
+        step=1,
+        key="v55_jogos_ano",
+    )
+  with c2:
+    mes = st.selectbox(
+        "Mês da edição",
+        options=list(range(1, 13)),
+        index=max(0, int(hoje.month) - 1),
+        format_func=lambda m: [
+            "Janeiro", "Fevereiro", "Março", "Abril",
+            "Maio", "Junho", "Julho", "Agosto",
+            "Setembro", "Outubro", "Novembro", "Dezembro",
+        ][m-1],
+        key="v55_jogos_mes",
+    )
+
+  jogos_id = _jogos_cla_id_v55(ano, mes)
+  rotulo = _jogos_cla_rotulo_v55(ano, mes)
+  ja_salvo = jogos_id in _jogos_cla_ids_salvos_v55()
+
+  st.caption(f"Identificador da edição: **{jogos_id}** — {rotulo}")
+
+  if ja_salvo:
+    st.error(
+        "🔒 Esta edição já consta em `JogosClaLancamentos`. "
+        "O salvamento definitivo está bloqueado para impedir pontuação duplicada."
+    )
+
+  base = _jogos_cla_base_elegiveis_v55()
+  if base.empty:
+    st.warning(
+        "Nenhum membro elegível ao Passe foi encontrado. "
+        "Sincronize Winning Wars + Vastaya antes do lançamento."
+    )
+    return
+
+  # Valores aplicados pelo modo em massa.
+  bulk_key = f"v55_bulk_{jogos_id}"
+  valores_bulk = st.session_state.get(bulk_key, {})
+  if valores_bulk:
+    base["Pontos Jogos"] = base["PlayerTag"].map(
+        lambda t: valores_bulk.get(_supercell_normalizar_tag(t), 0)
+    )
+
+  with st.expander("⚡ Preenchimento em massa por PlayerTag", expanded=False):
+    st.caption(
+        "Cole uma linha por jogador. Formatos aceitos: `#TAG 10000`, "
+        "`#TAG;10000` ou `#TAG:10000`."
+    )
+    texto_bulk = st.text_area(
+        "Lista de pontos",
+        height=180,
+        placeholder="#ABC123 10000\n#XYZ456 4500\n#QWE789 1800",
+        key=f"v55_texto_bulk_{jogos_id}",
+    )
+
+    if st.button(
+        "📥 Aplicar lista à tabela",
+        use_container_width=True,
+        key=f"v55_aplicar_bulk_{jogos_id}",
+    ):
+      parsed, erros = _parse_lista_jogos_v55(texto_bulk)
+      tags_validas = set(base["PlayerTag"].map(_supercell_normalizar_tag))
+      desconhecidas = sorted(tag for tag in parsed if tag not in tags_validas)
+      aceitas = {tag: pts for tag, pts in parsed.items() if tag in tags_validas}
+
+      st.session_state[bulk_key] = aceitas
+      st.session_state[f"v55_editor_version_{jogos_id}"] = (
+          st.session_state.get(f"v55_editor_version_{jogos_id}", 0) + 1
+      )
+
+      if erros:
+        st.warning("\n".join(erros))
+      if desconhecidas:
+        st.warning(
+            "PlayerTags ignoradas por não estarem elegíveis no Winning Wars: "
+            + ", ".join(desconhecidas)
+        )
+      st.success(f"✅ {len(aceitas)} lançamento(s) aplicado(s) à tabela.")
+      st.rerun()
+
+  st.caption(
+      f"🏆 **{len(base)} membros elegíveis.** Edite somente `Pontos Jogos`. "
+      "Quem permanecer em 0 será classificado como Não participou."
+  )
+
+  editor_version = st.session_state.get(f"v55_editor_version_{jogos_id}", 0)
+  editado = st.data_editor(
+      base,
+      use_container_width=True,
+      hide_index=True,
+      disabled=["Nome", "PlayerTag"],
+      column_config={
+          "Pontos Jogos": st.column_config.NumberColumn(
+              "Pontos Jogos",
+              min_value=0,
+              max_value=100000,
+              step=100,
+              format="%d",
+              help="Pontuação bruta obtida nos Jogos do Clã.",
+          ),
+      },
+      key=f"v55_editor_jogos_{jogos_id}_{editor_version}",
+  )
+
+  previa, meta = montar_previa_jogos_cla_v55(editado, ano, mes)
+
+  st.markdown("##### 📊 Prévia automática")
+  m1, m2, m3, m4, m5 = st.columns(5)
+  m1.metric("Elegíveis", meta.get("Elegiveis", 0))
+  m2.metric("Participaram", meta.get("Participaram", 0))
+  m3.metric("⚠️ Sanguessugas", meta.get("Sanguessugas", 0))
+  m4.metric("⛔ Não participaram", meta.get("NaoParticiparam", 0))
+  m5.metric("🏆 10.000+", meta.get("MetaMaxima", 0))
+
+  st.dataframe(
+      previa[[
+          "Jogador",
+          "PlayerTag",
+          "Pontos Jogos",
+          "Pontos Passe",
+          "Status Jogos",
+      ]],
+      use_container_width=True,
+      hide_index=True,
+  )
+
+  sanguessugas = previa[
+      previa["Status Jogos"].astype(str).str.startswith("⚠️")
+  ].copy()
+
+  if not sanguessugas.empty:
+    st.error(
+        f"⚠️ {len(sanguessugas)} jogador(es) participaram e ficaram abaixo "
+        "da meta obrigatória de 2.000 pontos."
+    )
+    st.dataframe(
+        sanguessugas[[
+            "Jogador", "PlayerTag", "Pontos Jogos", "Status Jogos"
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+  st.markdown("##### 💾 Lançamento definitivo")
+  st.warning(
+      "Ao confirmar, a coluna `JogosCla` será atualizada em lote para esta edição. "
+      "Um backup automático será criado antes da gravação."
+  )
+
+  confirma = st.checkbox(
+      f"Confirmo o lançamento definitivo de {rotulo}",
+      key=f"v55_confirmar_{jogos_id}",
+      disabled=ja_salvo,
+  )
+
+  if st.button(
+      "💾 Confirmar e lançar Jogos do Clã",
+      type="primary",
+      use_container_width=True,
+      disabled=(not confirma or ja_salvo),
+      key=f"v55_salvar_{jogos_id}",
+  ):
+    try:
+      with st.spinner("Criando backup e salvando toda a edição em lote..."):
+        resultado = gravar_jogos_cla_v55(previa, meta)
+
+      st.success(
+          f"✅ {resultado['aplicados']} jogadores processados; "
+          f"{resultado['alterados']} pontuações alteradas. "
+          f"A edição {jogos_id} foi bloqueada contra duplicidade."
+      )
+
+      if resultado["nao_encontrados"]:
+        st.warning(
+            "PlayerTags não localizadas na base: "
+            + ", ".join(resultado["nao_encontrados"])
+        )
+
+      st.session_state.pop(bulk_key, None)
+      st.rerun()
+
+    except Exception as exc:
+      st.error("❌ O lançamento dos Jogos do Clã não foi concluído.")
+      st.exception(exc)
+
+  with st.expander("📜 Histórico das edições já lançadas", expanded=False):
+    try:
+      hist = sheet_jogos_cla_lancamentos.get_all_records()
+    except Exception:
+      hist = []
+
+    if hist:
+      df_hist = pd.DataFrame(hist)
+      colunas = [
+          c for c in [
+              "JogosClaID", "Edicao", "DataHora", "Admin",
+              "PlayerTag", "Nome", "PontosJogos",
+              "PontosPasse", "StatusJogos"
+          ]
+          if c in df_hist.columns
+      ]
+      st.dataframe(
+          df_hist[colunas].tail(200).iloc[::-1],
+          use_container_width=True,
+          hide_index=True,
+      )
+    else:
+      st.info("Nenhuma edição dos Jogos do Clã foi lançada ainda.")
+
+
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
@@ -4971,6 +5557,9 @@ def renderizar_integracao_supercell():
 
   st.divider()
   renderizar_previa_raides_v53()
+
+  st.divider()
+  renderizar_jogos_cla_v55()
 
   st.divider()
   st.markdown("#### 📜 Histórico de movimentações")
