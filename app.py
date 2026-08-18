@@ -68,7 +68,18 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+import requests
 
+try:
+    ip_saida = requests.get(
+        "https://api.ipify.org",
+        timeout=10
+    ).text.strip()
+
+    st.info(f"🌐 IP público de saída do servidor: {ip_saida}")
+
+except Exception as e:
+    st.error(f"Não foi possível descobrir o IP: {e}")
 # --- PWA / ÍCONE PARA IPHONE, IPAD E ANDROID ---
 # O favicon continua configurado em st.set_page_config.
 # Para instalação na Tela de Início, reforçamos apple-touch-icon,
