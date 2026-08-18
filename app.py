@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v46 HOMOLOGAÇÃO - base v45 + conexão exclusiva por ID ao banco de testes.
+# Winning Wars v50 HOMOLOGAÇÃO - base v49 + gestão de movimentação Winning Wars/Vastaya por PlayerTag.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -571,6 +571,17 @@ def conectar_banco():
             "Aba", "Parte", "ConteudoJSON"
         ])
 
+    try:
+        sheet_movimentacoes_supercell = spreadsheet.worksheet("MovimentacoesSupercell")
+    except gspread.WorksheetNotFound:
+        sheet_movimentacoes_supercell = spreadsheet.add_worksheet(
+            title="MovimentacoesSupercell", rows="5000", cols="8"
+        )
+        sheet_movimentacoes_supercell.append_row([
+            "DataHora", "PlayerTag", "Nome", "StatusAnterior",
+            "StatusNovo", "ClaAnterior", "ClaNovo", "Detalhe"
+        ])
+
     return (
         sheet_dados,
         sheet_admins,
@@ -583,6 +594,7 @@ def conectar_banco():
         sheet_eventos,
         sheet_auditoria,
         sheet_backups,
+        sheet_movimentacoes_supercell,
     )
 
 
@@ -599,6 +611,7 @@ try:
         sheet_eventos,
         sheet_auditoria,
         sheet_backups,
+        sheet_movimentacoes_supercell,
     ) = conectar_banco()
 
 except Exception as e:
@@ -3280,8 +3293,8 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v48)
-# Leitura e comparação somente. Não altera pontuações nem grava dados na planilha.
+# SUPERCELL API - HOMOLOGAÇÃO (v50)
+# Gestão dos dois clãs, movimentações e importação oficial. Não altera pontuações.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
   tag = str(valor or "").strip().upper().replace(" ", "")
@@ -3301,115 +3314,584 @@ def supercell_configurada() -> bool:
   )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def consultar_cla_supercell():
-  token = str(st.secrets.get("supercell_api_token", "")).strip()
-  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+def supercell_duplo_cla_configurado() -> bool:
+  return bool(
+      supercell_configurada()
+      and str(st.secrets.get("supercell_secondary_clan_tag", "")).strip()
+  )
 
+
+def _supercell_headers_api():
+  token = str(st.secrets.get("supercell_api_token", "")).strip()
   if not token:
     raise RuntimeError("O Secret 'supercell_api_token' não foi configurado.")
-  if not clan_tag:
-    raise RuntimeError("O Secret 'supercell_clan_tag' não foi configurado.")
+  return {
+      "Authorization": f"Bearer {token}",
+      "Accept": "application/json",
+  }
 
-  url = f"https://api.clashofclans.com/v1/clans/{quote(clan_tag, safe='')}"
+
+@st.cache_data(ttl=60, show_spinner=False)
+def consultar_cla_supercell_por_tag(clan_tag: str):
+  tag = _supercell_normalizar_tag(clan_tag)
+  if not tag:
+    raise RuntimeError("Tag de clã vazia ou inválida.")
+
+  url = f"https://api.clashofclans.com/v1/clans/{quote(tag, safe='')}"
   resposta = requests.get(
       url,
-      headers={
-          "Authorization": f"Bearer {token}",
-          "Accept": "application/json",
-      },
+      headers=_supercell_headers_api(),
       timeout=20,
   )
 
   if resposta.status_code != 200:
     detalhe = resposta.text[:800]
     raise RuntimeError(
-        f"Supercell retornou HTTP {resposta.status_code}: {detalhe}"
+        f"Supercell retornou HTTP {resposta.status_code} para {tag}: {detalhe}"
     )
 
   return resposta.json()
 
 
-def montar_comparacao_membros_supercell(dados_cla, df_local):
-  membros_api = dados_cla.get("memberList", []) or []
-  local = df_local.copy() if df_local is not None else pd.DataFrame()
+def consultar_cla_supercell():
+  """Compatibilidade: consulta o clã principal configurado."""
+  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  if not clan_tag:
+    raise RuntimeError("O Secret 'supercell_clan_tag' não foi configurado.")
+  return consultar_cla_supercell_por_tag(clan_tag)
 
-  possui_nome = "Nome" in local.columns
-  possui_tag = "PlayerTag" in local.columns
 
-  por_tag = {}
-  por_nome = {}
-  if not local.empty and possui_nome:
-    for idx, row in local.iterrows():
-      nome = str(row.get("Nome", "") or "").strip()
-      tag = _supercell_normalizar_tag(row.get("PlayerTag", "")) if possui_tag else ""
-      registro = {"indice": idx, "nome": nome, "tag": tag}
-      if tag:
-        por_tag[tag] = registro
-      if nome:
-        por_nome.setdefault(_supercell_normalizar_nome(nome), registro)
+def consultar_dois_clas_supercell():
+  principal_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  secundario_tag = _supercell_normalizar_tag(
+      st.secrets.get("supercell_secondary_clan_tag", "")
+  )
 
-  vistos_local = set()
+  if not principal_tag:
+    raise RuntimeError("O Secret 'supercell_clan_tag' não foi configurado.")
+  if not secundario_tag:
+    raise RuntimeError(
+        "O Secret 'supercell_secondary_clan_tag' não foi configurado."
+    )
+
+  principal = consultar_cla_supercell_por_tag(principal_tag)
+  secundario = consultar_cla_supercell_por_tag(secundario_tag)
+  return principal, secundario
+
+
+def _supercell_agora_texto() -> str:
+  return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _supercell_parse_data(valor):
+  texto = str(valor or "").strip()
+  if not texto:
+    return None
+
+  formatos = (
+      "%Y-%m-%d %H:%M:%S",
+      "%d/%m/%Y %H:%M:%S",
+      "%d/%m/%Y %H:%M",
+  )
+  for formato in formatos:
+    try:
+      return datetime.strptime(texto, formato)
+    except ValueError:
+      continue
+  return None
+
+
+def _supercell_horas_inatividade() -> int:
+  try:
+    valor = int(st.secrets.get("supercell_inactive_after_hours", 48))
+    return max(1, valor)
+  except Exception:
+    return 48
+
+
+def _supercell_coluna_eh_pontuacao(nome_coluna: str) -> bool:
+  nome = str(nome_coluna or "").strip()
+  return (
+      nome in {"JogosCla", "Eventos"}
+      or nome.startswith("Guerra_")
+      or nome.startswith("Liga_")
+      or nome.startswith("Raide_")
+  )
+
+
+def _supercell_preparar_headers_importacao(headers_atuais):
+  headers = [str(h or "").strip() for h in headers_atuais]
+
+  # PlayerTag é a identidade permanente.
+  # StatusClan é a situação operacional do cadastro dentro dos dois clãs.
+  obrigatorias = [
+      "ID",
+      "Nome",
+      "PlayerTag",
+      "Cargo",
+      "NivelCV",
+      "StatusClan",
+      "ClaAtual",
+      "UltimaVezNoCla",
+      "UltimaSincronizacao",
+      "DataEntrada",
+      "DataSaida",
+  ]
+  for coluna in obrigatorias:
+    if coluna not in headers:
+      headers.append(coluna)
+
+  return headers
+
+
+def _supercell_mapa_membros(dados_principal, dados_secundario):
+  mapa = {}
+
+  for membro in dados_principal.get("memberList", []) or []:
+    tag = _supercell_normalizar_tag(membro.get("tag", ""))
+    if not tag:
+      continue
+    mapa[tag] = {
+        "membro": membro,
+        "status": "Principal",
+        "cla": str(dados_principal.get("name", "Winning Wars") or "Winning Wars"),
+    }
+
+  for membro in dados_secundario.get("memberList", []) or []:
+    tag = _supercell_normalizar_tag(membro.get("tag", ""))
+    if not tag:
+      continue
+    mapa[tag] = {
+        "membro": membro,
+        "status": "Vastaya",
+        "cla": str(dados_secundario.get("name", "Vastaya") or "Vastaya"),
+    }
+
+  return mapa
+
+
+def registrar_movimentacoes_supercell(movimentacoes):
+  if not movimentacoes:
+    return
+
+  linhas = []
+  for item in movimentacoes:
+    linhas.append([
+        item.get("DataHora", ""),
+        item.get("PlayerTag", ""),
+        item.get("Nome", ""),
+        item.get("StatusAnterior", ""),
+        item.get("StatusNovo", ""),
+        item.get("ClaAnterior", ""),
+        item.get("ClaNovo", ""),
+        item.get("Detalhe", ""),
+    ])
+
+  try:
+    sheet_movimentacoes_supercell.append_rows(
+        linhas,
+        value_input_option="USER_ENTERED",
+    )
+  except Exception as exc:
+    registrar_log(
+        st.session_state.get("admin_logado", "sistema"),
+        f"Falha ao registrar movimentações Supercell: {type(exc).__name__}: {exc}",
+    )
+
+
+def limpar_base_players_homologacao():
+  """Apaga apenas os registros da planilha principal, preservando os cabeçalhos."""
+  valores = sheet_dados.get_all_values()
+  if not valores:
+    raise RuntimeError("A planilha principal está vazia e não possui cabeçalhos.")
+
+  headers = valores[0]
+  if not headers:
+    raise RuntimeError("Não foi possível identificar os cabeçalhos da planilha principal.")
+
+  exigir_backup_automatico(
+      "v50 - Limpeza da base de players da HOMOLOGAÇÃO",
+      [("DadosPlayers", sheet_dados)],
+  )
+
+  sheet_dados.resize(rows=1)
+  sheet_dados.resize(rows=200)
+
+  try:
+    obter_dados_cached.clear()
+  except Exception:
+    pass
+
+  registrar_log(
+      st.session_state.get("admin_logado", "sistema"),
+      "v50: limpou a base de players da homologação após backup automático",
+  )
+
+
+def importar_membros_supercell_base():
+  """Recria a base usando a união dos membros do Winning Wars e do Vastaya.
+
+  Nenhuma pontuação é importada. As colunas de pontuação existentes começam em zero.
+  """
+  dados_principal, dados_secundario = consultar_dois_clas_supercell()
+  mapa_membros = _supercell_mapa_membros(dados_principal, dados_secundario)
+
+  if not mapa_membros:
+    raise RuntimeError("A Supercell não retornou membros para os clãs configurados.")
+
+  valores = sheet_dados.get_all_values()
+  if not valores:
+    raise RuntimeError("A planilha principal não possui linha de cabeçalho.")
+
+  headers_atuais = valores[0]
+  headers = _supercell_preparar_headers_importacao(headers_atuais)
+
+  if headers != headers_atuais:
+    if len(headers) > sheet_dados.col_count:
+      sheet_dados.resize(cols=len(headers))
+    ultima_coluna = gspread.utils.rowcol_to_a1(1, len(headers)).replace("1", "")
+    sheet_dados.update(
+        range_name=f"A1:{ultima_coluna}1",
+        values=[headers],
+        value_input_option="RAW",
+    )
+
+  exigir_backup_automatico(
+      "v50 - Importação/recriação da base via Supercell (Winning Wars + Vastaya)",
+      [("DadosPlayers", sheet_dados)],
+  )
+
+  agora = _supercell_agora_texto()
   linhas = []
 
-  for membro in membros_api:
-    tag = _supercell_normalizar_tag(membro.get("tag", ""))
-    nome = str(membro.get("name", "") or "").strip()
-    correspondencia = None
-    status = "🆕 Novo no clã / não encontrado na planilha"
-    criterio = "Nenhum"
+  # Principal primeiro e Vastaya depois para facilitar a conferência visual.
+  ordenados = sorted(
+      mapa_membros.items(),
+      key=lambda item: (
+          0 if item[1]["status"] == "Principal" else 1,
+          str(item[1]["membro"].get("name", "")).casefold(),
+      ),
+  )
 
-    if tag and tag in por_tag:
-      correspondencia = por_tag[tag]
-      status = "✅ Vinculado por PlayerTag"
-      criterio = "PlayerTag"
+  for indice, (tag, info) in enumerate(ordenados, start=1):
+    membro = info["membro"]
+    registro = {coluna: "" for coluna in headers}
+
+    registro["ID"] = indice
+    registro["Nome"] = str(membro.get("name", "") or "").strip()
+    registro["PlayerTag"] = tag
+    registro["Cargo"] = str(membro.get("role", "") or "").strip()
+    registro["NivelCV"] = membro.get("townHallLevel", "")
+    registro["StatusClan"] = info["status"]
+    registro["ClaAtual"] = info["cla"]
+    registro["UltimaVezNoCla"] = agora
+    registro["UltimaSincronizacao"] = agora
+    registro["DataEntrada"] = agora
+    registro["DataSaida"] = ""
+
+    for coluna in headers:
+      if _supercell_coluna_eh_pontuacao(coluna):
+        registro[coluna] = 0
+
+    linhas.append([registro.get(coluna, "") for coluna in headers])
+
+  sheet_dados.resize(rows=1)
+  sheet_dados.resize(rows=max(200, len(linhas) + 20))
+
+  if linhas:
+    ultima_coluna = gspread.utils.rowcol_to_a1(1, len(headers)).replace("1", "")
+    sheet_dados.update(
+        range_name=f"A2:{ultima_coluna}{len(linhas) + 1}",
+        values=linhas,
+        value_input_option="USER_ENTERED",
+    )
+
+  movimentacoes = []
+  for tag, info in ordenados:
+    membro = info["membro"]
+    movimentacoes.append({
+        "DataHora": agora,
+        "PlayerTag": tag,
+        "Nome": str(membro.get("name", "") or "").strip(),
+        "StatusAnterior": "",
+        "StatusNovo": info["status"],
+        "ClaAnterior": "",
+        "ClaNovo": info["cla"],
+        "Detalhe": "Cadastro inicial/importação v50",
+    })
+  registrar_movimentacoes_supercell(movimentacoes)
+
+  try:
+    obter_dados_cached.clear()
+  except Exception:
+    pass
+
+  registrar_log(
+      st.session_state.get("admin_logado", "sistema"),
+      f"v50: importou {len(linhas)} membros dos dois clãs via Supercell",
+  )
+
+  return dados_principal, dados_secundario, len(linhas)
+
+
+def sincronizar_movimentacao_supercell():
+  """Sincroniza localização/status dos players sem alterar qualquer pontuação."""
+  dados_principal, dados_secundario = consultar_dois_clas_supercell()
+  mapa_api = _supercell_mapa_membros(dados_principal, dados_secundario)
+
+  valores = sheet_dados.get_all_values()
+  if not valores:
+    raise RuntimeError("A planilha principal está vazia.")
+
+  headers_atuais = valores[0]
+  headers = _supercell_preparar_headers_importacao(headers_atuais)
+
+  if headers != headers_atuais:
+    if len(headers) > sheet_dados.col_count:
+      sheet_dados.resize(cols=len(headers))
+    ultima_coluna = gspread.utils.rowcol_to_a1(1, len(headers)).replace("1", "")
+    sheet_dados.update(
+        range_name=f"A1:{ultima_coluna}1",
+        values=[headers],
+        value_input_option="RAW",
+    )
+
+  # Reconstrói registros preservando todo o conteúdo atual, inclusive pontuações.
+  registros = []
+  for linha in valores[1:]:
+    registro = {}
+    for idx, coluna in enumerate(headers_atuais):
+      registro[coluna] = linha[idx] if idx < len(linha) else ""
+    for coluna in headers:
+      registro.setdefault(coluna, "")
+    if str(registro.get("Nome", "") or "").strip() or str(registro.get("PlayerTag", "") or "").strip():
+      registros.append(registro)
+
+  por_tag = {}
+  for registro in registros:
+    tag = _supercell_normalizar_tag(registro.get("PlayerTag", ""))
+    if tag:
+      por_tag[tag] = registro
+
+  agora_dt = datetime.now()
+  agora = agora_dt.strftime("%Y-%m-%d %H:%M:%S")
+  limite_horas = _supercell_horas_inatividade()
+  movimentacoes = []
+  contadores = {
+      "Principal": 0,
+      "Vastaya": 0,
+      "Ausente temporário": 0,
+      "Inativo": 0,
+      "Novos": 0,
+      "Movimentacoes": 0,
+  }
+
+  # 1) Quem apareceu em um dos clãs.
+  for tag, info in mapa_api.items():
+    membro = info["membro"]
+    status_novo = info["status"]
+    cla_novo = info["cla"]
+
+    registro = por_tag.get(tag)
+    novo = registro is None
+
+    if novo:
+      registro = {coluna: "" for coluna in headers}
+      registro["ID"] = len(registros) + 1
+      registro["PlayerTag"] = tag
+      registro["DataEntrada"] = agora
+      for coluna in headers:
+        if _supercell_coluna_eh_pontuacao(coluna):
+          registro[coluna] = 0
+      registros.append(registro)
+      por_tag[tag] = registro
+      contadores["Novos"] += 1
+
+    status_anterior = str(registro.get("StatusClan", "") or "").strip()
+    cla_anterior = str(registro.get("ClaAtual", "") or "").strip()
+    nome_anterior = str(registro.get("Nome", "") or "").strip()
+
+    registro["Nome"] = str(membro.get("name", "") or "").strip()
+    registro["PlayerTag"] = tag
+    registro["Cargo"] = str(membro.get("role", "") or "").strip()
+    registro["NivelCV"] = membro.get("townHallLevel", "")
+    registro["StatusClan"] = status_novo
+    registro["ClaAtual"] = cla_novo
+    registro["UltimaVezNoCla"] = agora
+    registro["UltimaSincronizacao"] = agora
+    registro["DataSaida"] = ""
+
+    if not str(registro.get("DataEntrada", "") or "").strip():
+      registro["DataEntrada"] = agora
+
+    contadores[status_novo] += 1
+
+    mudou = novo or status_anterior != status_novo or cla_anterior != cla_novo
+    nome_mudou = bool(nome_anterior and nome_anterior != registro["Nome"])
+
+    if mudou or nome_mudou:
+      detalhe = []
+      if novo:
+        detalhe.append("Novo PlayerTag detectado")
+      if status_anterior != status_novo:
+        detalhe.append("Mudança de status")
+      if cla_anterior != cla_novo:
+        detalhe.append("Mudança de clã")
+      if nome_mudou:
+        detalhe.append(f"Nome atualizado: {nome_anterior} → {registro['Nome']}")
+
+      movimentacoes.append({
+          "DataHora": agora,
+          "PlayerTag": tag,
+          "Nome": registro["Nome"],
+          "StatusAnterior": status_anterior,
+          "StatusNovo": status_novo,
+          "ClaAnterior": cla_anterior,
+          "ClaNovo": cla_novo,
+          "Detalhe": "; ".join(detalhe),
+      })
+
+  # 2) Quem existe na base, mas não apareceu em nenhum dos dois clãs.
+  for registro in registros:
+    tag = _supercell_normalizar_tag(registro.get("PlayerTag", ""))
+    if not tag or tag in mapa_api:
+      continue
+
+    status_anterior = str(registro.get("StatusClan", "") or "").strip()
+    cla_anterior = str(registro.get("ClaAtual", "") or "").strip()
+    ultima_vista = _supercell_parse_data(registro.get("UltimaVezNoCla", ""))
+
+    # Para bases antigas sem histórico, inicia a janela de tolerância agora.
+    if ultima_vista is None:
+      ultima_vista = agora_dt
+      registro["UltimaVezNoCla"] = agora
+
+    horas_fora = max(0.0, (agora_dt - ultima_vista).total_seconds() / 3600.0)
+
+    if horas_fora < limite_horas:
+      status_novo = "Ausente temporário"
     else:
-      nome_norm = _supercell_normalizar_nome(nome)
-      if nome_norm and nome_norm in por_nome:
-        correspondencia = por_nome[nome_norm]
-        if possui_tag and correspondencia.get("tag"):
-          status = "⚠️ Nome igual, mas PlayerTag diferente"
-        else:
-          status = "🟡 Nome correspondente — falta vincular PlayerTag"
-        criterio = "Nome"
+      status_novo = "Inativo"
 
-    if correspondencia is not None:
-      vistos_local.add(correspondencia["indice"])
+    registro["StatusClan"] = status_novo
+    registro["ClaAtual"] = ""
+    registro["UltimaSincronizacao"] = agora
+
+    if status_novo == "Inativo" and not str(registro.get("DataSaida", "") or "").strip():
+      registro["DataSaida"] = agora
+    elif status_novo == "Ausente temporário":
+      registro["DataSaida"] = ""
+
+    contadores[status_novo] += 1
+
+    if status_anterior != status_novo or cla_anterior:
+      detalhe = (
+          f"Não localizado no Winning Wars nem no Vastaya; "
+          f"{horas_fora:.1f}h desde a última presença registrada."
+      )
+      movimentacoes.append({
+          "DataHora": agora,
+          "PlayerTag": tag,
+          "Nome": str(registro.get("Nome", "") or "").strip(),
+          "StatusAnterior": status_anterior,
+          "StatusNovo": status_novo,
+          "ClaAnterior": cla_anterior,
+          "ClaNovo": "",
+          "Detalhe": detalhe,
+      })
+
+  # Reatribui IDs apenas quando estão vazios; não usa nome como identidade.
+  ids_usados = set()
+  proximo_id = 1
+  for registro in registros:
+    id_atual = str(registro.get("ID", "") or "").strip()
+    if id_atual:
+      ids_usados.add(id_atual)
+
+  for registro in registros:
+    if not str(registro.get("ID", "") or "").strip():
+      while str(proximo_id) in ids_usados:
+        proximo_id += 1
+      registro["ID"] = proximo_id
+      ids_usados.add(str(proximo_id))
+      proximo_id += 1
+
+  linhas = [[registro.get(coluna, "") for coluna in headers] for registro in registros]
+  ultima_coluna = gspread.utils.rowcol_to_a1(1, len(headers)).replace("1", "")
+
+  sheet_dados.resize(rows=1)
+  sheet_dados.resize(rows=max(200, len(linhas) + 20))
+  sheet_dados.update(
+      range_name=f"A1:{ultima_coluna}{len(linhas) + 1}",
+      values=[headers] + linhas,
+      value_input_option="USER_ENTERED",
+  )
+
+  registrar_movimentacoes_supercell(movimentacoes)
+  contadores["Movimentacoes"] = len(movimentacoes)
+
+  try:
+    obter_dados_cached.clear()
+  except Exception:
+    pass
+
+  registrar_log(
+      st.session_state.get("admin_logado", "sistema"),
+      (
+          "v50: sincronização dos dois clãs concluída "
+          f"(Principal={contadores['Principal']}, Vastaya={contadores['Vastaya']}, "
+          f"Ausentes={contadores['Ausente temporário']}, Inativos={contadores['Inativo']}, "
+          f"Novos={contadores['Novos']})"
+      ),
+  )
+
+  return dados_principal, dados_secundario, contadores, movimentacoes
+
+
+def montar_comparacao_dois_clas(dados_principal, dados_secundario, df_local):
+  mapa_api = _supercell_mapa_membros(dados_principal, dados_secundario)
+  local = df_local.copy() if df_local is not None else pd.DataFrame()
+
+  por_tag = {}
+  if not local.empty and "PlayerTag" in local.columns:
+    for _, row in local.iterrows():
+      tag = _supercell_normalizar_tag(row.get("PlayerTag", ""))
+      if tag:
+        por_tag[tag] = row
+
+  linhas = []
+  vistos = set()
+
+  for tag, info in mapa_api.items():
+    membro = info["membro"]
+    local_row = por_tag.get(tag)
+    vistos.add(tag)
 
     linhas.append({
-        "Status": status,
-        "Nome Supercell": nome,
+        "Status": "✅ Cadastrado" if local_row is not None else "🆕 Novo PlayerTag",
+        "Nome": str(membro.get("name", "") or "").strip(),
         "PlayerTag": tag,
-        "Nome na planilha": correspondencia.get("nome", "") if correspondencia else "",
-        "Tag na planilha": correspondencia.get("tag", "") if correspondencia else "",
-        "Critério": criterio,
+        "Localização": info["status"],
+        "Clã": info["cla"],
         "Cargo": membro.get("role", ""),
-        "Nível XP": membro.get("expLevel", ""),
+        "CV": membro.get("townHallLevel", ""),
         "Troféus": membro.get("trophies", ""),
-        "Doações": membro.get("donations", ""),
-        "Recebidas": membro.get("donationsReceived", ""),
     })
 
-  if not local.empty and possui_nome:
-    for idx, row in local.iterrows():
-      if idx in vistos_local:
+  if not local.empty and "PlayerTag" in local.columns:
+    for _, row in local.iterrows():
+      tag = _supercell_normalizar_tag(row.get("PlayerTag", ""))
+      if not tag or tag in vistos:
         continue
-      nome_local = str(row.get("Nome", "") or "").strip()
-      if not nome_local:
-        continue
-      tag_local = _supercell_normalizar_tag(row.get("PlayerTag", "")) if possui_tag else ""
       linhas.append({
-          "Status": "⚪ Está na planilha, mas não aparece no clã",
-          "Nome Supercell": "",
-          "PlayerTag": "",
-          "Nome na planilha": nome_local,
-          "Tag na planilha": tag_local,
-          "Critério": "Somente planilha",
-          "Cargo": "",
-          "Nível XP": "",
+          "Status": "⚪ Não localizado nos dois clãs",
+          "Nome": str(row.get("Nome", "") or "").strip(),
+          "PlayerTag": tag,
+          "Localização": str(row.get("StatusClan", "") or "").strip(),
+          "Clã": str(row.get("ClaAtual", "") or "").strip(),
+          "Cargo": str(row.get("Cargo", "") or "").strip(),
+          "CV": row.get("NivelCV", ""),
           "Troféus": "",
-          "Doações": "",
-          "Recebidas": "",
       })
 
   return pd.DataFrame(linhas)
@@ -3418,86 +3900,202 @@ def montar_comparacao_membros_supercell(dados_cla, df_local):
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
-      "Homologação: esta área consulta e compara os membros do clã. "
-      "Nenhuma pontuação é alterada e nenhum dado é gravado automaticamente."
+      "v50 HOMOLOGAÇÃO: Winning Wars + Vastaya, identificação por PlayerTag, "
+      "movimentação entre clãs e janela de ausência. Nenhuma pontuação é alterada."
   )
 
-  if not supercell_configurada():
+  if not supercell_duplo_cla_configurado():
     st.error(
-        "Configure 'supercell_api_token' e 'supercell_clan_tag' nos Secrets do Streamlit."
+        "Configure nos Secrets: 'supercell_api_token', 'supercell_clan_tag' e "
+        "'supercell_secondary_clan_tag'."
     )
     return
 
-  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
-  st.info(f"Clã configurado: **{clan_tag}**")
+  principal_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  secundario_tag = _supercell_normalizar_tag(
+      st.secrets.get("supercell_secondary_clan_tag", "")
+  )
+  limite_horas = _supercell_horas_inatividade()
+
+  ctag1, ctag2, ctag3 = st.columns(3)
+  ctag1.info(f"🏰 Principal: **{principal_tag}**")
+  ctag2.info(f"🛡️ Vastaya: **{secundario_tag}**")
+  ctag3.info(f"⏱️ Inatividade após: **{limite_horas}h**")
+
+  st.markdown("#### 1️⃣ Conferir os dois clãs")
+  if st.button(
+      "🔎 Consultar Winning Wars + Vastaya",
+      type="secondary",
+      use_container_width=True,
+      key="v50_consultar_dois_clas",
+  ):
+    try:
+      consultar_cla_supercell_por_tag.clear()
+      with st.spinner("Consultando os dois clãs na Supercell..."):
+        principal, secundario = consultar_dois_clas_supercell()
+        dados_locais = pd.DataFrame(obter_dados_cached())
+        comparacao = montar_comparacao_dois_clas(
+            principal, secundario, dados_locais
+        )
+
+      st.session_state["v50_principal"] = principal
+      st.session_state["v50_secundario"] = secundario
+      st.session_state["v50_comparacao"] = comparacao
+      st.session_state["v50_ultima_consulta"] = _supercell_agora_texto()
+      st.success("✅ Os dois clãs foram consultados.")
+    except Exception as exc:
+      st.error("❌ Falha ao consultar os clãs.")
+      st.exception(exc)
+
+  principal = st.session_state.get("v50_principal")
+  secundario = st.session_state.get("v50_secundario")
+  comparacao = st.session_state.get("v50_comparacao")
+
+  if principal and secundario:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        principal.get("name", "Winning Wars"),
+        principal.get("members", len(principal.get("memberList", []))),
+    )
+    m2.metric(
+        secundario.get("name", "Vastaya"),
+        secundario.get("members", len(secundario.get("memberList", []))),
+    )
+    total_tags = len(_supercell_mapa_membros(principal, secundario))
+    m3.metric("Players únicos nos dois", total_tags)
+    m4.metric("Última consulta", st.session_state.get("v50_ultima_consulta", "-"))
+
+    if comparacao is not None:
+      st.dataframe(comparacao, use_container_width=True, hide_index=True)
+
+  st.divider()
+
+  st.markdown("#### 2️⃣ Sincronizar movimentação")
+  st.caption(
+      "Atualiza Nome, Cargo, CV, StatusClan, ClaAtual e datas por PlayerTag. "
+      "Também inclui novos PlayerTags encontrados. Pontuações existentes são preservadas."
+  )
+
+  st.info(
+      "Regra: no Winning Wars → **Principal**; no Vastaya → **Vastaya**; "
+      f"fora dos dois por menos de {limite_horas}h → **Ausente temporário**; "
+      f"fora por {limite_horas}h ou mais → **Inativo**."
+  )
 
   if st.button(
       "🔄 Sincronizar membros",
       type="primary",
       use_container_width=True,
-      key="supercell_sincronizar_membros",
+      key="v50_sincronizar_movimentacao",
   ):
     try:
-      consultar_cla_supercell.clear()
-      with st.spinner("Consultando a API oficial da Supercell..."):
-        dados_cla = consultar_cla_supercell()
-        comparacao = montar_comparacao_membros_supercell(dados_cla, df)
+      consultar_cla_supercell_por_tag.clear()
+      with st.spinner("Sincronizando localização dos membros sem alterar pontuação..."):
+        principal, secundario, contadores, movimentacoes = (
+            sincronizar_movimentacao_supercell()
+        )
 
-      st.session_state["supercell_dados_cla"] = dados_cla
-      st.session_state["supercell_comparacao"] = comparacao
-      st.session_state["supercell_ultima_sync"] = data_hora_postagem()
-      st.success("✅ Membros consultados e comparados com a planilha de homologação.")
+      st.session_state["v50_resultado_sync"] = contadores
+      st.session_state["v50_movimentacoes_sync"] = movimentacoes
+      st.session_state["v50_principal"] = principal
+      st.session_state["v50_secundario"] = secundario
+      st.session_state["v50_ultima_consulta"] = _supercell_agora_texto()
+      st.success("✅ Sincronização concluída. Nenhuma pontuação foi alterada.")
     except Exception as exc:
-      st.error("❌ Não foi possível sincronizar os membros com a Supercell.")
+      st.error("❌ Falha na sincronização.")
       st.exception(exc)
-      return
 
-  dados_cla = st.session_state.get("supercell_dados_cla")
-  comparacao = st.session_state.get("supercell_comparacao")
+  resultado = st.session_state.get("v50_resultado_sync")
+  if resultado:
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("🏰 Principal", resultado.get("Principal", 0))
+    r2.metric("🛡️ Vastaya", resultado.get("Vastaya", 0))
+    r3.metric("⏳ Ausentes", resultado.get("Ausente temporário", 0))
+    r4.metric("⚫ Inativos", resultado.get("Inativo", 0))
+    r5.metric("🆕 Novos", resultado.get("Novos", 0))
 
-  if not dados_cla or comparacao is None:
-    st.warning(
-        "Clique em **Sincronizar membros** para carregar a primeira comparação."
-    )
-    return
+    movimentacoes = st.session_state.get("v50_movimentacoes_sync", [])
+    if movimentacoes:
+      st.markdown("##### 🔁 Movimentações detectadas nesta sincronização")
+      st.dataframe(pd.DataFrame(movimentacoes), use_container_width=True, hide_index=True)
+    else:
+      st.success("Nenhuma movimentação nova foi detectada.")
 
-  c1, c2, c3, c4 = st.columns(4)
-  c1.metric("Clã", dados_cla.get("name", "-"))
-  c2.metric("Nível", dados_cla.get("clanLevel", "-"))
-  c3.metric("Membros API", dados_cla.get("members", len(dados_cla.get("memberList", []))))
-  c4.metric("Última sincronização", st.session_state.get("supercell_ultima_sync", "-"))
+  st.divider()
 
-  total_vinculados = int(comparacao["Status"].astype(str).str.startswith("✅").sum()) if not comparacao.empty else 0
-  total_nome = int(comparacao["Status"].astype(str).str.startswith("🟡").sum()) if not comparacao.empty else 0
-  total_novos = int(comparacao["Status"].astype(str).str.startswith("🆕").sum()) if not comparacao.empty else 0
-  total_fora = int(comparacao["Status"].astype(str).str.startswith("⚪").sum()) if not comparacao.empty else 0
-
-  m1, m2, m3, m4 = st.columns(4)
-  m1.metric("✅ Vinculados por tag", total_vinculados)
-  m2.metric("🟡 Correspondência por nome", total_nome)
-  m3.metric("🆕 Novos / não encontrados", total_novos)
-  m4.metric("⚪ Só na planilha", total_fora)
-
-  if "PlayerTag" not in df.columns:
-    st.warning(
-        "A planilha principal ainda não possui a coluna **PlayerTag**. "
-        "Por isso, nesta fase a comparação usa o nome como aproximação. "
-        "A v48 não cria essa coluna nem grava tags automaticamente."
-    )
-
-  st.markdown("#### 📋 Comparação Supercell × Google Sheets")
-  st.dataframe(
-      comparacao,
-      use_container_width=True,
-      hide_index=True,
-      column_config={
-          "PlayerTag": st.column_config.TextColumn("PlayerTag Supercell"),
-      },
+  st.markdown("#### 3️⃣ Reinicializar base de homologação")
+  st.warning(
+      "Use apenas se você ainda pretende recomeçar a base. A limpeza preserva os "
+      "cabeçalhos e cria backup automático obrigatório."
   )
 
+  confirmacao = st.text_input(
+      "Para liberar a limpeza, digite exatamente: LIMPAR HOMOLOGACAO",
+      key="v50_confirmar_limpeza_players",
+  )
+  limpar_habilitado = confirmacao.strip().upper() == "LIMPAR HOMOLOGACAO"
+
+  if st.button(
+      "🧹 Limpar base de jogadores",
+      type="secondary",
+      use_container_width=True,
+      disabled=not limpar_habilitado,
+      key="v50_limpar_base_players",
+  ):
+    try:
+      with st.spinner("Criando backup e limpando somente os players..."):
+        limpar_base_players_homologacao()
+      st.success("✅ Base limpa; cabeçalhos e demais abas foram preservados.")
+      st.rerun()
+    except Exception as exc:
+      st.error("❌ A limpeza foi cancelada ou falhou.")
+      st.exception(exc)
+
+  st.markdown("##### ⬇️ Importação inicial dos dois clãs")
   st.caption(
-      "✅ = vínculo confiável por tag · 🟡 = nome igual, ainda sem tag vinculada · "
-      "🆕 = membro da Supercell não encontrado na planilha · ⚪ = registro local fora do clã."
+      "Importa a união dos membros atuais do Winning Wars e Vastaya. "
+      "Cada PlayerTag entra uma única vez e todas as pontuações começam em zero."
+  )
+
+  if st.button(
+      "⬇️ Importar Winning Wars + Vastaya",
+      type="primary",
+      use_container_width=True,
+      key="v50_importar_dois_clas",
+  ):
+    try:
+      consultar_cla_supercell_por_tag.clear()
+      with st.spinner("Importando os membros dos dois clãs..."):
+        principal, secundario, quantidade = importar_membros_supercell_base()
+
+      st.success(
+          f"✅ {quantidade} players únicos importados. Nenhuma pontuação foi importada."
+      )
+      st.rerun()
+    except Exception as exc:
+      st.error("❌ Não foi possível realizar a importação inicial.")
+      st.exception(exc)
+
+  st.divider()
+  st.markdown("#### 📜 Histórico de movimentações")
+  try:
+    historico_mov = sheet_movimentacoes_supercell.get_all_records()
+  except Exception:
+    historico_mov = []
+
+  if historico_mov:
+    df_mov = pd.DataFrame(historico_mov)
+    st.dataframe(
+        df_mov.tail(100).iloc[::-1],
+        use_container_width=True,
+        hide_index=True,
+    )
+  else:
+    st.info("Ainda não há movimentações registradas.")
+
+  st.caption(
+      "🔒 Toda identificação usa PlayerTag. Mudanças de nome ou caracteres especiais "
+      "não criam um novo jogador. A sincronização desta versão não altera pontuações."
   )
 
 
