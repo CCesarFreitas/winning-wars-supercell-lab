@@ -7,7 +7,7 @@ import re
 import time
 import requests
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import gspread
