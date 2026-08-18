@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v60 HOMOLOGAÇÃO - torneios ativos/arquivados separados e chave visual Lado A x Lado B.
+# Winning Wars v61 HOMOLOGAÇÃO - encerramento manual de torneios + arquivo consultável com histórico completo.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -3463,7 +3463,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v60)
+# SUPERCELL API - HOMOLOGAÇÃO (v61)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -7800,7 +7800,7 @@ def obter_torneios_ativos_v60():
   return [
       t for t in obter_torneios_v58()
       if str(t.get("Status", "") or "").strip().upper()
-      not in {"FINALIZADO", "ARQUIVADO"}
+      not in {"FINALIZADO", "ENCERRADO", "ARQUIVADO"}
   ]
 
 
@@ -7824,15 +7824,15 @@ def _deletar_linhas_torneio_v60(sheet, torneio_id):
 
 
 def arquivar_torneio_v60(torneio_id):
-  """Move torneio finalizado e todo seu histórico das planilhas ativas para o arquivo."""
+  """Move torneio encerrado/finalizado e todo seu histórico das planilhas ativas para o arquivo."""
   torneio = _torneio_por_id_v58(torneio_id)
   if not torneio:
     # Pode já estar arquivado.
     return False
 
   status = str(torneio.get("Status", "") or "").strip().upper()
-  if status != "FINALIZADO":
-    raise RuntimeError("Somente torneios FINALIZADOS podem ser arquivados.")
+  if status not in {"FINALIZADO", "ENCERRADO"}:
+    raise RuntimeError("Somente torneios FINALIZADOS ou ENCERRADOS podem ser arquivados.")
 
   # Idempotência do arquivo.
   if any(
@@ -7865,7 +7865,7 @@ def arquivar_torneio_v60(torneio_id):
       torneio.get("TorneioID", ""),
       torneio.get("Nome", ""),
       torneio.get("Descricao", ""),
-      "FINALIZADO",
+      status,
       torneio.get("Visibilidade", ""),
       torneio.get("CVsPermitidos", ""),
       torneio.get("Formato", ""),
@@ -7940,11 +7940,62 @@ def arquivar_torneio_v60(torneio_id):
   return True
 
 
+
+def encerrar_torneio_v61(torneio_id, motivo="Encerrado manualmente pelo administrador"):
+  torneio = _torneio_por_id_v58(torneio_id)
+  if not torneio:
+    raise RuntimeError("Torneio não encontrado.")
+
+  status_atual = str(torneio.get("Status", "") or "").strip().upper()
+  if status_atual in {"FINALIZADO", "ENCERRADO", "ARQUIVADO"}:
+    # Garante que não fique preso na área ativa.
+    return arquivar_torneio_v60(torneio_id)
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  exigir_backup_automatico(
+      f"Encerrar torneio {torneio_id}",
+      [
+          ("Torneios", sheet_torneios),
+          ("TorneioParticipantes", sheet_torneio_participantes),
+          ("TorneioPartidas", sheet_torneio_partidas),
+          ("TorneiosArquivo", sheet_torneios_arquivo),
+          ("TorneioParticipantesArquivo", sheet_torneio_participantes_arquivo),
+          ("TorneioPartidasArquivo", sheet_torneio_partidas_arquivo),
+      ],
+  )
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      torneio_id,
+      {
+          "Status": "ENCERRADO",
+          "Visibilidade": "OCULTO",
+          "Observacoes": (
+              (str(torneio.get("Observacoes", "") or "").strip() + " | ")
+              if str(torneio.get("Observacoes", "") or "").strip()
+              else ""
+          ) + str(motivo or "").strip(),
+          "AtualizadoEm": agora,
+      },
+  )
+
+  _torneio_v59_limpar_cache()
+
+  registrar_log(
+      st.session_state.get("admin_logado", "sistema"),
+      f"Encerrou manualmente o torneio {torneio_id}",
+  )
+
+  return arquivar_torneio_v60(torneio_id)
+
+
 def arquivar_finalizados_antigos_v60():
   """Migra automaticamente finalizados deixados pelas versões anteriores."""
   finalizados = [
       t for t in obter_torneios_v58()
-      if str(t.get("Status", "") or "").strip().upper() == "FINALIZADO"
+      if str(t.get("Status", "") or "").strip().upper() in {"FINALIZADO", "ENCERRADO"}
   ]
   arquivados = 0
   for t in finalizados:
@@ -8502,6 +8553,38 @@ def renderizar_torneios_v60():
           st.markdown(f"📺 **Transmissão:** {t.get('YoutubeURL')}")
         _torneio_v60_render_chave(tid)
 
+        st.divider()
+        with st.expander("🛑 Encerrar torneio", expanded=False):
+          st.warning(
+              "Encerrar remove o torneio da Arena ativa e o envia para o Arquivo. "
+              "Participantes, partidas, resultados e campeão (se houver) são preservados."
+          )
+          motivo_encerramento = st.text_input(
+              "Motivo do encerramento (opcional)",
+              placeholder="Ex.: torneio cancelado, teste concluído, evento encerrado",
+              key=f"v61_motivo_encerrar_{tid}",
+          )
+          confirmar_encerramento = st.checkbox(
+              "Confirmo que desejo encerrar este torneio",
+              key=f"v61_confirmar_encerrar_{tid}",
+          )
+          if st.button(
+              "🛑 Encerrar e arquivar torneio",
+              type="primary",
+              use_container_width=True,
+              disabled=not confirmar_encerramento,
+              key=f"v61_encerrar_{tid}",
+          ):
+            try:
+              encerrar_torneio_v61(
+                  tid,
+                  motivo_encerramento or "Encerrado manualmente pelo administrador",
+              )
+              st.success("✅ Torneio encerrado e arquivado.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+
     with tab_pub:
       todos = obter_torneios_ativos_v60()
       if not todos:
@@ -8554,7 +8637,7 @@ def renderizar_torneios_v60():
         df_arq = pd.DataFrame(historico)
         cols_arq = [
             c for c in [
-                "Nome", "CampeaoNome", "CVsPermitidos",
+                "Nome", "Status", "CampeaoNome", "CVsPermitidos",
                 "DataCriacao", "AtualizadoEm", "ArquivadoEm"
             ]
             if c in df_arq.columns
@@ -8564,6 +8647,81 @@ def renderizar_torneios_v60():
             use_container_width=True,
             hide_index=True,
         )
+
+        mapa_arq = {
+            f"{t.get('Nome','Torneio')} — {t.get('Status','')} — {t.get('ArquivadoEm','')}":
+            t.get("TorneioID")
+            for t in historico
+        }
+        escolha_arq = st.selectbox(
+            "🔎 Consultar torneio arquivado",
+            options=list(mapa_arq.keys()),
+            key="v61_consulta_arquivo",
+        )
+        tid_arq = mapa_arq[escolha_arq]
+        torneio_arq = next(
+            (
+                t for t in historico
+                if str(t.get("TorneioID", "")).strip() == str(tid_arq).strip()
+            ),
+            None,
+        )
+
+        if torneio_arq:
+          a1, a2, a3 = st.columns(3)
+          a1.metric("Status", torneio_arq.get("Status", "-"))
+          a2.metric("Campeão", torneio_arq.get("CampeaoNome", "-") or "-")
+          a3.metric("CVs", torneio_arq.get("CVsPermitidos", "-"))
+
+          if str(torneio_arq.get("Descricao", "") or "").strip():
+            st.write(torneio_arq.get("Descricao"))
+
+          # Participantes arquivados
+          try:
+            parts_arq = [
+                p for p in sheet_torneio_participantes_arquivo.get_all_records()
+                if str(p.get("TorneioID", "")).strip() == str(tid_arq).strip()
+            ]
+          except Exception:
+            parts_arq = []
+
+          if parts_arq:
+            with st.expander("👥 Participantes arquivados"):
+              df_parts_arq = pd.DataFrame(parts_arq)
+              cols_parts = [
+                  c for c in ["Nome", "PlayerTag", "CentroVila", "Status"]
+                  if c in df_parts_arq.columns
+              ]
+              st.dataframe(
+                  df_parts_arq[cols_parts],
+                  use_container_width=True,
+                  hide_index=True,
+              )
+
+          # Partidas arquivadas
+          try:
+            jogos_arq = [
+                p for p in sheet_torneio_partidas_arquivo.get_all_records()
+                if str(p.get("TorneioID", "")).strip() == str(tid_arq).strip()
+            ]
+          except Exception:
+            jogos_arq = []
+
+          if jogos_arq:
+            with st.expander("⚔️ Partidas e resultados arquivados"):
+              df_jogos_arq = pd.DataFrame(jogos_arq)
+              cols_jogos = [
+                  c for c in [
+                      "Fase", "Ordem", "P1Nome", "P2Nome",
+                      "VencedorNome", "Status", "Origem"
+                  ]
+                  if c in df_jogos_arq.columns
+              ]
+              st.dataframe(
+                  df_jogos_arq[cols_jogos],
+                  use_container_width=True,
+                  hide_index=True,
+              )
       else:
         st.info("Nenhum torneio arquivado ainda.")
 
