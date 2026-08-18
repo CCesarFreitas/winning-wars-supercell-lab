@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v58 HOMOLOGAÇÃO - plataforma de torneios 1x1 com inscrições, chaveamento e publicação controlada.
+# Winning Wars v59 HOMOLOGAÇÃO - Arena independente, sorteios por fase e repescagem para inscrições ímpares.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -786,6 +786,14 @@ def _ler_sheets_com_retry(funcao, tentativas: int = 4):
 def obter_dados_cached():
   try:
     return _ler_sheets_com_retry(sheet_dados.get_all_records)
+  except Exception:
+    return []
+
+
+@st.cache_data(ttl=60)
+def obter_torneios_nav_v59():
+  try:
+    return _ler_sheets_com_retry(sheet_torneios.get_all_records)
   except Exception:
     return []
 
@@ -1885,16 +1893,39 @@ with col_nav:
   # Container com chave própria para que as animações atinjam somente
   # os botões de direcionamento do topo da página.
   with st.container(key="top_nav_menu"):
-    b1, b2, b3 = st.columns(3)
+    torneios_nav_v59 = obter_torneios_nav_v59()
+    existe_torneio_publico_v59 = any(
+        str(t.get("Visibilidade", "") or "").strip().upper() == "PUBLICO"
+        for t in torneios_nav_v59
+    )
+    exibir_botao_torneio_v59 = (
+        "admin_logado" in st.session_state
+        or existe_torneio_publico_v59
+    )
+
+    if exibir_botao_torneio_v59:
+      b1, b2, b3, b4 = st.columns(4)
+    else:
+      b1, b2, b4 = st.columns(3)
+      b3 = None
+
     with b1:
       if st.button("⚔️ LAYOUTS PARA GUERRA", use_container_width=True):
         st.session_state["pagina_atual"] = "layouts_guerra"
         st.rerun()
+
     with b2:
       if st.button("🏆 LAYOUTS PARA RANKEADAS", use_container_width=True):
         st.session_state["pagina_atual"] = "layouts_rankeada"
         st.rerun()
-    with b3:
+
+    if b3 is not None:
+      with b3:
+        if st.button("🏟️ ARENA DE TORNEIOS", use_container_width=True):
+          st.session_state["pagina_atual"] = "torneios"
+          st.rerun()
+
+    with b4:
       st.markdown(
           '<a'
           ' href="https://link.clashofclans.com/pt?action=OpenClanProfile&tag=2YPL9GU8Y"'
@@ -3388,7 +3419,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v58)
+# SUPERCELL API - HOMOLOGAÇÃO (v59)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -7052,6 +7083,1109 @@ def renderizar_torneios_v58():
     _renderizar_chaveamento_visual_v58(tid)
 
 
+
+# =============================================================================
+# ARENA DE TORNEIOS v59 — página independente + repescagem
+# =============================================================================
+
+def _torneio_v59_participantes(tid):
+  return [
+      p for p in obter_torneio_participantes_v58()
+      if str(p.get("TorneioID", "")).strip() == str(tid).strip()
+  ]
+
+
+def _torneio_v59_partidas(tid):
+  partidas = [
+      p for p in obter_torneio_partidas_v58()
+      if str(p.get("TorneioID", "")).strip() == str(tid).strip()
+  ]
+  try:
+    partidas.sort(
+        key=lambda p: (
+            int(float(p.get("Rodada", 0) or 0)),
+            int(float(p.get("Ordem", 0) or 0)),
+        )
+    )
+  except Exception:
+    pass
+  return partidas
+
+
+def _torneio_v59_limpar_cache():
+  obter_torneios_v58.clear()
+  obter_torneio_participantes_v58.clear()
+  obter_torneio_partidas_v58.clear()
+  try:
+    obter_torneios_nav_v59.clear()
+  except Exception:
+    pass
+
+
+def _torneio_v59_status_participante(pid, status):
+  if not pid:
+    return
+  _atualizar_linha_por_id_v58(
+      sheet_torneio_participantes,
+      "ParticipanteID",
+      pid,
+      {"Status": status},
+  )
+
+
+def _torneio_v59_partida_id(tid, rodada, ordem):
+  return f"{tid}-V59-R{int(rodada):03d}-M{int(ordem):03d}"
+
+
+def _torneio_v59_potencia_anterior(n):
+  p = 1
+  while p * 2 < int(n):
+    p *= 2
+  return max(2, p)
+
+
+def _torneio_v59_fase_principal(n):
+  return {
+      16: "🛡️ Oitavas de final",
+      8: "⚔️ Quartas de final",
+      4: "🔥 Semifinal",
+      2: "🏆 Final",
+  }.get(int(n), f"Chave principal — {n} jogadores")
+
+
+def _torneio_v59_classificados(tid):
+  return [
+      p for p in _torneio_v59_participantes(tid)
+      if str(p.get("Status", "")).upper()
+      in {"INSCRITO", "CLASSIFICADO", "DIRETO"}
+  ]
+
+
+def _torneio_v59_criar_partidas(tid, jogadores, rodada, fase, origem):
+  if len(jogadores) % 2 != 0:
+    raise RuntimeError("A lista de confrontos precisa ser par.")
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  linhas = []
+  for i in range(0, len(jogadores), 2):
+    p1 = jogadores[i]
+    p2 = jogadores[i + 1]
+    ordem = i // 2 + 1
+    linhas.append([
+        tid,
+        _torneio_v59_partida_id(tid, rodada, ordem),
+        rodada,
+        fase,
+        ordem,
+        p1["ParticipanteID"],
+        p1["Nome"],
+        p2["ParticipanteID"],
+        p2["Nome"],
+        "",
+        "",
+        "AGUARDANDO",
+        agora,
+        "",
+        origem,
+    ])
+
+  if linhas:
+    sheet_torneio_partidas.append_rows(
+        linhas,
+        value_input_option="USER_ENTERED",
+    )
+  _torneio_v59_limpar_cache()
+
+
+def sortear_eliminatoria_v59(tid):
+  jogadores = _torneio_v59_classificados(tid)
+  n = len(jogadores)
+
+  if n < 3:
+    raise RuntimeError("São necessários pelo menos 3 jogadores para uma eliminatória.")
+  if n in {2, 4, 8, 16}:
+    raise RuntimeError(
+        f"Já existem {n} classificados. Faça o sorteio da chave principal."
+    )
+
+  # Reduz à próxima chave adequada.
+  if n > 16:
+    alvo = 16 if n <= 32 else _torneio_v59_potencia_anterior(n)
+  else:
+    alvo = _torneio_v59_potencia_anterior(n)
+
+  qtd_partidas = n - alvo
+  qtd_em_confrontos = qtd_partidas * 2
+  qtd_diretos = n - qtd_em_confrontos
+
+  random.shuffle(jogadores)
+  em_confronto = jogadores[:qtd_em_confrontos]
+  diretos = jogadores[qtd_em_confrontos:]
+
+  # Se o total é ímpar, 1 jogador fica aguardando a repescagem.
+  aguardando = None
+  if n % 2 == 1 and diretos:
+    aguardando = random.choice(diretos)
+    diretos = [
+        p for p in diretos
+        if p["ParticipanteID"] != aguardando["ParticipanteID"]
+    ]
+    _torneio_v59_status_participante(
+        aguardando["ParticipanteID"],
+        "AGUARDANDO_REPESCAGEM",
+    )
+
+  for p in diretos:
+    _torneio_v59_status_participante(
+        p["ParticipanteID"],
+        "CLASSIFICADO",
+    )
+
+  partidas_existentes = _torneio_v59_partidas(tid)
+  eliminatorias = [
+      p for p in partidas_existentes
+      if str(p.get("Origem", "")).upper() == "ELIMINATORIA"
+  ]
+  rodadas = [
+      int(float(p.get("Rodada", 0) or 0))
+      for p in eliminatorias
+  ]
+  rodada = max(rodadas) + 1 if rodadas else 1
+  indice = len(set(rodadas)) + 1 if rodadas else 1
+
+  _torneio_v59_criar_partidas(
+      tid,
+      em_confronto,
+      rodada,
+      f"🎲 Eliminatória {indice}",
+      "ELIMINATORIA",
+  )
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      tid,
+      {
+          "Status": "ELIMINATORIA",
+          "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      },
+  )
+  _torneio_v59_limpar_cache()
+
+
+def _torneio_v59_criar_repescagem(tid, jogadores, indice):
+  if not jogadores:
+    return
+
+  jogadores = list(jogadores)
+  random.shuffle(jogadores)
+  rodada = 100 + int(indice)
+  fase = f"♻️ Repescagem — rodada {indice}"
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  linhas = []
+  ordem = 1
+
+  # Se a própria repescagem ficar ímpar, 1 derrotado recebe avanço sorteado.
+  if len(jogadores) % 2 == 1:
+    bye = jogadores.pop()
+    linhas.append([
+        tid,
+        _torneio_v59_partida_id(tid, rodada, ordem),
+        rodada,
+        fase,
+        ordem,
+        bye["ParticipanteID"],
+        bye["Nome"],
+        "",
+        "AVANÇO",
+        bye["ParticipanteID"],
+        bye["Nome"],
+        "BYE",
+        agora,
+        "Avanço sorteado dentro da repescagem",
+        "REPESCAGEM",
+    ])
+    ordem += 1
+
+  for i in range(0, len(jogadores), 2):
+    p1 = jogadores[i]
+    p2 = jogadores[i + 1]
+    linhas.append([
+        tid,
+        _torneio_v59_partida_id(tid, rodada, ordem),
+        rodada,
+        fase,
+        ordem,
+        p1["ParticipanteID"],
+        p1["Nome"],
+        p2["ParticipanteID"],
+        p2["Nome"],
+        "",
+        "",
+        "AGUARDANDO",
+        agora,
+        "",
+        "REPESCAGEM",
+    ])
+    ordem += 1
+
+  sheet_torneio_partidas.append_rows(
+      linhas,
+      value_input_option="USER_ENTERED",
+  )
+  _torneio_v59_limpar_cache()
+
+
+def _torneio_v59_iniciar_repescagem(tid):
+  partidas = _torneio_v59_partidas(tid)
+  elim = [
+      p for p in partidas
+      if str(p.get("Origem", "")).upper() == "ELIMINATORIA"
+  ]
+  if not elim:
+    return
+
+  rodada = max(int(float(p.get("Rodada", 0) or 0)) for p in elim)
+  atuais = [
+      p for p in elim
+      if int(float(p.get("Rodada", 0) or 0)) == rodada
+  ]
+  if any(not str(p.get("VencedorID", "") or "").strip() for p in atuais):
+    return
+
+  participantes = _torneio_v59_participantes(tid)
+  aguardando = next(
+      (
+          p for p in participantes
+          if str(p.get("Status", "")).upper() == "AGUARDANDO_REPESCAGEM"
+      ),
+      None,
+  )
+
+  # Em quantidade par não há repescagem especial.
+  if not aguardando:
+    _atualizar_linha_por_id_v58(
+        sheet_torneios,
+        "TorneioID",
+        tid,
+        {
+            "Status": "PRONTO_PROXIMA_FASE",
+            "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
+    _torneio_v59_limpar_cache()
+    return
+
+  if any(
+      str(p.get("Origem", "")).upper() in {"REPESCAGEM", "DUELO_REPESCAGEM"}
+      for p in partidas
+  ):
+    return
+
+  mapa = {
+      str(p.get("ParticipanteID", "")): p
+      for p in participantes
+  }
+  perdedores = []
+
+  for p in atuais:
+    p1 = str(p.get("P1ID", "") or "").strip()
+    p2 = str(p.get("P2ID", "") or "").strip()
+    vencedor = str(p.get("VencedorID", "") or "").strip()
+    perdedor = p2 if vencedor == p1 else p1
+    if perdedor in mapa:
+      perdedores.append(mapa[perdedor])
+      _torneio_v59_status_participante(
+          perdedor,
+          "REPESCAGEM",
+      )
+
+  _torneio_v59_criar_repescagem(
+      tid,
+      perdedores,
+      1,
+  )
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      tid,
+      {
+          "Status": "REPESCAGEM",
+          "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      },
+  )
+  _torneio_v59_limpar_cache()
+
+
+def _torneio_v59_avancar_repescagem(tid):
+  partidas = _torneio_v59_partidas(tid)
+  rep = [
+      p for p in partidas
+      if str(p.get("Origem", "")).upper() == "REPESCAGEM"
+  ]
+  if not rep:
+    return
+
+  rodada = max(int(float(p.get("Rodada", 0) or 0)) for p in rep)
+  atuais = [
+      p for p in rep
+      if int(float(p.get("Rodada", 0) or 0)) == rodada
+  ]
+  if any(not str(p.get("VencedorID", "") or "").strip() for p in atuais):
+    return
+
+  mapa = {
+      str(p.get("ParticipanteID", "")): p
+      for p in _torneio_v59_participantes(tid)
+  }
+  vencedores = []
+  for p in sorted(
+      atuais,
+      key=lambda x: int(float(x.get("Ordem", 0) or 0)),
+  ):
+    vid = str(p.get("VencedorID", "") or "").strip()
+    if vid in mapa:
+      vencedores.append(mapa[vid])
+
+  if len(vencedores) > 1:
+    proximo_indice = rodada - 100 + 1
+    proxima_rodada = 100 + proximo_indice
+    if any(
+        int(float(p.get("Rodada", 0) or 0)) == proxima_rodada
+        for p in rep
+    ):
+      return
+    _torneio_v59_criar_repescagem(
+        tid,
+        vencedores,
+        proximo_indice,
+    )
+    return
+
+  if len(vencedores) == 1:
+    if any(
+        str(p.get("Origem", "")).upper() == "DUELO_REPESCAGEM"
+        for p in partidas
+    ):
+      return
+
+    aguardando = next(
+        (
+            p for p in _torneio_v59_participantes(tid)
+            if str(p.get("Status", "")).upper()
+            == "AGUARDANDO_REPESCAGEM"
+        ),
+        None,
+    )
+    if not aguardando:
+      return
+
+    campeao_rep = vencedores[0]
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    sheet_torneio_partidas.append_row([
+        tid,
+        _torneio_v59_partida_id(tid, 190, 1),
+        190,
+        "♻️ Repescagem — duelo pela vaga",
+        1,
+        aguardando["ParticipanteID"],
+        aguardando["Nome"],
+        campeao_rep["ParticipanteID"],
+        campeao_rep["Nome"],
+        "",
+        "",
+        "AGUARDANDO",
+        agora,
+        "Vencedor ocupa a última vaga da próxima fase",
+        "DUELO_REPESCAGEM",
+    ])
+    _torneio_v59_limpar_cache()
+
+
+def sortear_chave_principal_v59(tid):
+  jogadores = _torneio_v59_classificados(tid)
+  n = len(jogadores)
+
+  if n not in {2, 4, 8, 16}:
+    raise RuntimeError(
+        f"A chave precisa ter 16, 8, 4 ou 2 classificados. Agora existem {n}."
+    )
+
+  if any(
+      str(p.get("Origem", "")).upper() == "CHAVE_PRINCIPAL"
+      for p in _torneio_v59_partidas(tid)
+  ):
+    raise RuntimeError("A chave principal já foi sorteada.")
+
+  random.shuffle(jogadores)
+  _torneio_v59_criar_partidas(
+      tid,
+      jogadores,
+      200,
+      _torneio_v59_fase_principal(n),
+      "CHAVE_PRINCIPAL",
+  )
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      tid,
+      {
+          "Status": "CHAVE_PRINCIPAL",
+          "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      },
+  )
+  _torneio_v59_limpar_cache()
+
+
+def _torneio_v59_avancar_chave(tid):
+  partidas = _torneio_v59_partidas(tid)
+  chave = [
+      p for p in partidas
+      if str(p.get("Origem", "")).upper() == "CHAVE_PRINCIPAL"
+  ]
+  if not chave:
+    return
+
+  rodada = max(int(float(p.get("Rodada", 0) or 0)) for p in chave)
+  atuais = [
+      p for p in chave
+      if int(float(p.get("Rodada", 0) or 0)) == rodada
+  ]
+  if any(not str(p.get("VencedorID", "") or "").strip() for p in atuais):
+    return
+
+  if len(atuais) == 1:
+    final = atuais[0]
+    cid = str(final.get("VencedorID", "") or "").strip()
+    cnome = str(final.get("VencedorNome", "") or "").strip()
+
+    _atualizar_linha_por_id_v58(
+        sheet_torneios,
+        "TorneioID",
+        tid,
+        {
+            "Status": "FINALIZADO",
+            "CampeaoID": cid,
+            "CampeaoNome": cnome,
+            "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
+    _torneio_v59_status_participante(cid, "CAMPEAO")
+    _torneio_v59_limpar_cache()
+    return
+
+  proxima = rodada + 1
+  if any(
+      int(float(p.get("Rodada", 0) or 0)) == proxima
+      for p in chave
+  ):
+    return
+
+  participantes = {
+      str(p.get("ParticipanteID", "")): p
+      for p in _torneio_v59_participantes(tid)
+  }
+
+  vencedores = []
+  for p in sorted(
+      atuais,
+      key=lambda x: int(float(x.get("Ordem", 0) or 0)),
+  ):
+    vid = str(p.get("VencedorID", "") or "").strip()
+    if vid in participantes:
+      vencedores.append(participantes[vid])
+
+  # Sem novo sorteio: a posição da chave determina os próximos confrontos.
+  _torneio_v59_criar_partidas(
+      tid,
+      vencedores,
+      proxima,
+      _torneio_v59_fase_principal(len(vencedores)),
+      "CHAVE_PRINCIPAL",
+  )
+
+
+def definir_vencedor_partida_v59(partida_id, vencedor_id):
+  partida = next(
+      (
+          p for p in obter_torneio_partidas_v58()
+          if str(p.get("PartidaID", "")).strip() == str(partida_id).strip()
+      ),
+      None,
+  )
+  if not partida:
+    raise RuntimeError("Partida não encontrada.")
+  if str(partida.get("VencedorID", "") or "").strip():
+    raise RuntimeError("Esta partida já possui vencedor definido.")
+
+  p1 = str(partida.get("P1ID", "") or "").strip()
+  p2 = str(partida.get("P2ID", "") or "").strip()
+  nomes = {
+      p1: str(partida.get("P1Nome", "") or "").strip(),
+      p2: str(partida.get("P2Nome", "") or "").strip(),
+  }
+  nomes = {k: v for k, v in nomes.items() if k}
+  if vencedor_id not in nomes:
+    raise RuntimeError("Vencedor inválido.")
+
+  perdedor = next((pid for pid in nomes if pid != vencedor_id), "")
+  origem = str(partida.get("Origem", "") or "").upper()
+  tid = str(partida.get("TorneioID", "") or "")
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneio_partidas,
+      "PartidaID",
+      partida_id,
+      {
+          "VencedorID": vencedor_id,
+          "VencedorNome": nomes[vencedor_id],
+          "Status": "FINALIZADA",
+          "DataAtualizacao": agora,
+      },
+  )
+
+  if origem == "ELIMINATORIA":
+    _torneio_v59_status_participante(vencedor_id, "CLASSIFICADO")
+    existe_espera = any(
+        str(p.get("Status", "")).upper() == "AGUARDANDO_REPESCAGEM"
+        for p in _torneio_v59_participantes(tid)
+    )
+    if perdedor:
+      _torneio_v59_status_participante(
+          perdedor,
+          "REPESCAGEM_PENDENTE" if existe_espera else "ELIMINADO",
+      )
+
+  elif origem == "REPESCAGEM":
+    _torneio_v59_status_participante(vencedor_id, "REPESCAGEM")
+    if perdedor:
+      _torneio_v59_status_participante(perdedor, "ELIMINADO")
+
+  elif origem == "DUELO_REPESCAGEM":
+    _torneio_v59_status_participante(vencedor_id, "CLASSIFICADO")
+    if perdedor:
+      _torneio_v59_status_participante(perdedor, "ELIMINADO")
+
+  elif origem == "CHAVE_PRINCIPAL":
+    _torneio_v59_status_participante(vencedor_id, "CLASSIFICADO")
+    if perdedor:
+      _torneio_v59_status_participante(perdedor, "ELIMINADO")
+
+  _torneio_v59_limpar_cache()
+
+  if origem == "ELIMINATORIA":
+    _torneio_v59_iniciar_repescagem(tid)
+  elif origem == "REPESCAGEM":
+    _torneio_v59_avancar_repescagem(tid)
+  elif origem == "DUELO_REPESCAGEM":
+    _atualizar_linha_por_id_v58(
+        sheet_torneios,
+        "TorneioID",
+        tid,
+        {
+            "Status": "PRONTO_PROXIMA_FASE",
+            "AtualizadoEm": agora,
+        },
+    )
+    _torneio_v59_limpar_cache()
+  elif origem == "CHAVE_PRINCIPAL":
+    _torneio_v59_avancar_chave(tid)
+
+
+def _torneio_v59_css():
+  st.markdown(
+      """
+      <style>
+      .ww-arena59{
+        position:relative;overflow:hidden;border-radius:28px;padding:30px;
+        border:1px solid rgba(250,204,21,.36);
+        background:
+          radial-gradient(circle at 86% 18%,rgba(250,204,21,.17),transparent 25%),
+          radial-gradient(circle at 12% 86%,rgba(59,130,246,.17),transparent 28%),
+          linear-gradient(135deg,#050b14,#111827 48%,#172033);
+        box-shadow:0 22px 58px rgba(0,0,0,.35);margin-bottom:22px;
+      }
+      .ww-arena59-title{font-size:2.25rem;font-weight:950;color:#facc15}
+      .ww-arena59-sub{color:#cbd5e1;margin-top:7px;max-width:900px}
+      .ww-stage59{
+        border-left:4px solid #facc15;padding-left:14px;margin:26px 0 10px;
+        font-size:1.35rem;font-weight:950;color:#f8fafc;
+      }
+      .ww-match59{
+        border:1px solid #334155;border-radius:17px;padding:14px 16px;
+        background:linear-gradient(180deg,#111827,#080e19);
+        margin:8px 0;box-shadow:0 9px 25px rgba(0,0,0,.2);
+      }
+      .ww-wait59{
+        border:1px dashed #f59e0b;border-radius:17px;padding:15px;
+        background:rgba(245,158,11,.08);color:#fde68a;margin:12px 0;
+      }
+      .ww-champ59{
+        text-align:center;border:1px solid rgba(250,204,21,.62);
+        border-radius:24px;padding:24px;
+        background:linear-gradient(135deg,#422006,#111827 72%);
+        box-shadow:0 0 40px rgba(250,204,21,.14);margin-top:18px;
+      }
+      </style>
+      """,
+      unsafe_allow_html=True,
+  )
+
+
+def _torneio_v59_render_chave(tid):
+  torneio = _torneio_por_id_v58(tid)
+  partidas = _torneio_v59_partidas(tid)
+  participantes = _torneio_v59_participantes(tid)
+
+  esperando = [
+      p for p in participantes
+      if str(p.get("Status", "")).upper() == "AGUARDANDO_REPESCAGEM"
+  ]
+  if esperando:
+    st.markdown(
+        f"""
+        <div class="ww-wait59">
+          ⏳ <b>{esperando[0].get("Nome","")}</b> está aguardando o campeão
+          da repescagem. O vencedor desse duelo ocupará a última vaga da etapa.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+  if not partidas:
+    st.info("O sorteio ainda não foi realizado.")
+    return
+
+  fases = []
+  for p in partidas:
+    chave = (
+        str(p.get("Fase", "")),
+        int(float(p.get("Rodada", 0) or 0)),
+    )
+    if chave not in fases:
+      fases.append(chave)
+
+  for fase, rodada in fases:
+    grupo = [
+        p for p in partidas
+        if str(p.get("Fase", "")) == fase
+        and int(float(p.get("Rodada", 0) or 0)) == rodada
+    ]
+    st.markdown(
+        f'<div class="ww-stage59">{fase}</div>',
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(min(2, max(1, len(grupo))))
+    for idx, p in enumerate(grupo):
+      with cols[idx % len(cols)]:
+        vencedor = str(p.get("VencedorNome", "") or "").strip()
+        footer = (
+            f'<div style="color:#86efac;font-weight:950">🏅 {vencedor}</div>'
+            if vencedor else
+            f'<div style="color:#94a3b8;font-size:.8rem">Status: {p.get("Status","")}</div>'
+        )
+        st.markdown(
+            f"""
+            <div class="ww-match59">
+              <div style="color:#facc15;font-size:.72rem;font-weight:900">
+                CONFRONTO {p.get("Ordem","")}
+              </div>
+              <div style="font-weight:850;color:#f8fafc;padding:5px 0">
+                🛡️ {p.get("P1Nome","BYE")}
+              </div>
+              <div style="font-size:.72rem;color:#64748b;font-weight:900">VS</div>
+              <div style="font-weight:850;color:#f8fafc;padding:5px 0">
+                ⚔️ {p.get("P2Nome","BYE")}
+              </div>
+              {footer}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+  if torneio and str(torneio.get("Status", "")).upper() == "FINALIZADO":
+    st.markdown(
+        f"""
+        <div class="ww-champ59">
+          <div style="font-size:2.8rem">🏆</div>
+          <div style="color:#facc15;font-weight:950">CAMPEÃO</div>
+          <div style="font-size:2.05rem;font-weight:950;color:white">
+            {torneio.get("CampeaoNome","")}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _torneio_v59_controles_resultado(tid):
+  pendentes = [
+      p for p in _torneio_v59_partidas(tid)
+      if not str(p.get("VencedorID", "") or "").strip()
+      and str(p.get("P1ID", "") or "").strip()
+      and str(p.get("P2ID", "") or "").strip()
+  ]
+
+  if not pendentes:
+    return
+
+  st.markdown("### ✅ Atualizar resultados")
+  for p in pendentes:
+    partida_id = str(p.get("PartidaID", ""))
+    p1id = str(p.get("P1ID", ""))
+    p2id = str(p.get("P2ID", ""))
+    p1n = str(p.get("P1Nome", ""))
+    p2n = str(p.get("P2Nome", ""))
+
+    with st.expander(
+        f"{p.get('Fase','')} · {p1n} ⚔️ {p2n}",
+        expanded=False,
+    ):
+      vencedor = st.radio(
+          "Vencedor",
+          [p1id, p2id],
+          format_func=lambda x, a=p1id, an=p1n, bn=p2n: an if x == a else bn,
+          horizontal=True,
+          key=f"v59_result_{partida_id}",
+      )
+      if st.button(
+          "🏅 Confirmar vencedor",
+          use_container_width=True,
+          key=f"v59_result_btn_{partida_id}",
+      ):
+        exigir_backup_automatico(
+            f"Resultado {partida_id}",
+            [
+                ("Torneios", sheet_torneios),
+                ("TorneioParticipantes", sheet_torneio_participantes),
+                ("TorneioPartidas", sheet_torneio_partidas),
+            ],
+        )
+        definir_vencedor_partida_v59(partida_id, vencedor)
+        registrar_log(
+            st.session_state.get("admin_logado", "sistema"),
+            f"Definiu vencedor {partida_id}",
+        )
+        st.success("Resultado confirmado.")
+        st.rerun()
+
+
+def renderizar_torneios_v59():
+  _torneio_v59_css()
+  admin = "admin_logado" in st.session_state
+
+  if st.button("⬅️ Voltar ao Winning Wars APP", key="v59_back"):
+    st.session_state["pagina_atual"] = "principal"
+    st.rerun()
+
+  st.markdown(
+      """
+      <div class="ww-arena59">
+        <div class="ww-arena59-title">🏟️ Winning Wars — Arena de Torneios</div>
+        <div class="ww-arena59-sub">
+          Ambiente independente para torneios 1x1: Eliminatórias, Repescagem,
+          Oitavas, Quartas, Semifinal e Final. O sorteio ocorre na eliminatória
+          e novamente na entrada das Oitavas; depois a chave segue fixa.
+        </div>
+      </div>
+      """,
+      unsafe_allow_html=True,
+  )
+
+  torneios = obter_torneios_v58()
+  if not admin:
+    torneios = [
+        t for t in torneios
+        if str(t.get("Visibilidade", "")).upper() == "PUBLICO"
+    ]
+
+  if not torneios and not admin:
+    st.info("Nenhum torneio está liberado ao público.")
+    return
+
+  if admin:
+    tab_arena, tab_criar, tab_insc, tab_sorteio, tab_pub = st.tabs([
+        "🏟️ Arena",
+        "✨ Criar",
+        "📝 Inscrições",
+        "🎲 Sorteios & Resultados",
+        "📡 Publicação",
+    ])
+
+    with tab_criar:
+      with st.form("v59_create_t", clear_on_submit=True):
+        nome = st.text_input("Nome do torneio")
+        descricao = st.text_area("Descrição / regras / premiação")
+        cvs = st.multiselect(
+            "Centros de Vila permitidos",
+            list(range(8, 19)),
+            default=[16, 17],
+            format_func=lambda x: f"CV {x}",
+        )
+        youtube = st.text_input("Link YouTube / transmissão (opcional)")
+        obs = st.text_area("Observações")
+        if st.form_submit_button("🏆 Criar torneio", use_container_width=True):
+          try:
+            criar_torneio_v58(nome, descricao, cvs, youtube, obs)
+            _torneio_v59_limpar_cache()
+            st.success("Torneio criado.")
+            st.rerun()
+          except Exception as exc:
+            st.error(str(exc))
+
+    with tab_insc:
+      abertos = [
+          t for t in obter_torneios_v58()
+          if str(t.get("Status", "")).upper() in {"INSCRICOES", "RASCUNHO"}
+      ]
+      if not abertos:
+        st.info("Nenhum torneio com inscrições abertas.")
+      else:
+        mapa = {t.get("Nome"): t.get("TorneioID") for t in abertos}
+        escolha = st.selectbox("Torneio", list(mapa.keys()), key="v59_ins_t")
+        tid = mapa[escolha]
+        t = _torneio_por_id_v58(tid)
+
+        cvs = []
+        for item in str(t.get("CVsPermitidos", "")).split(","):
+          try:
+            cvs.append(int(item.strip()))
+          except Exception:
+            pass
+
+        with st.form("v59_add_player", clear_on_submit=True):
+          c1, c2 = st.columns(2)
+          with c1:
+            nome = st.text_input("Nome")
+            tag = st.text_input("PlayerTag (opcional)")
+          with c2:
+            cv = st.selectbox("Centro de Vila", cvs or list(range(8, 19)))
+            seed = st.number_input("Seed opcional", min_value=0, value=0, step=1)
+          obs = st.text_input("Observação")
+          if st.form_submit_button("➕ Inscrever", use_container_width=True):
+            try:
+              adicionar_participante_v58(
+                  tid, nome, tag, cv, seed if seed > 0 else "", obs
+              )
+              _torneio_v59_limpar_cache()
+              st.success("Participante inscrito.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+
+        participantes = _torneio_v59_participantes(tid)
+        if participantes:
+          dfp = pd.DataFrame(participantes)
+          cols = [
+              c for c in ["Nome", "PlayerTag", "CentroVila", "Seed", "Status"]
+              if c in dfp.columns
+          ]
+          st.dataframe(dfp[cols], use_container_width=True, hide_index=True)
+
+    with tab_sorteio:
+      todos = obter_torneios_v58()
+      if not todos:
+        st.info("Nenhum torneio criado.")
+      else:
+        mapa = {
+            f"{t.get('Nome')} — {t.get('Status')}": t.get("TorneioID")
+            for t in todos
+        }
+        escolha = st.selectbox("Torneio", list(mapa.keys()), key="v59_draw_t")
+        tid = mapa[escolha]
+        t = _torneio_por_id_v58(tid)
+
+        classificados = _torneio_v59_classificados(tid)
+        partidas = _torneio_v59_partidas(tid)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Disponíveis", len(classificados))
+        c2.metric("Status", t.get("Status", "-"))
+        c3.metric("Confrontos", len(partidas))
+
+        st.info(
+            "🎲 **Fluxo:** sorteio na Eliminatória → se houver número ímpar, "
+            "1 jogador aguarda e os derrotados entram na Repescagem → o campeão "
+            "da Repescagem enfrenta o jogador em espera → ao chegar a 16 classificados, "
+            "novo sorteio das Oitavas → Quartas, Semi e Final seguem a chave fixa."
+        )
+
+        _torneio_v59_render_chave(tid)
+
+        possui_chave = any(
+            str(p.get("Origem", "")).upper() == "CHAVE_PRINCIPAL"
+            for p in partidas
+        )
+
+        if (
+            len(classificados) not in {2, 4, 8, 16}
+            and str(t.get("Status", "")).upper() != "FINALIZADO"
+        ):
+          if st.button(
+              "🎲 Sortear confrontos da Eliminatória",
+              type="primary",
+              use_container_width=True,
+              key=f"v59_draw_elim_{tid}",
+          ):
+            try:
+              exigir_backup_automatico(
+                  f"Sorteio eliminatória {tid}",
+                  [
+                      ("Torneios", sheet_torneios),
+                      ("TorneioParticipantes", sheet_torneio_participantes),
+                      ("TorneioPartidas", sheet_torneio_partidas),
+                  ],
+              )
+              sortear_eliminatoria_v59(tid)
+              registrar_log(
+                  st.session_state.get("admin_logado", "sistema"),
+                  f"Sorteou eliminatória {tid}",
+              )
+              st.success("Eliminatória sorteada.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+
+        elif (
+            len(classificados) in {2, 4, 8, 16}
+            and not possui_chave
+            and str(t.get("Status", "")).upper() != "FINALIZADO"
+        ):
+          fase = _torneio_v59_fase_principal(len(classificados))
+          if st.button(
+              f"🎲 Sortear {fase.replace('🛡️ ', '').replace('⚔️ ', '').replace('🔥 ', '').replace('🏆 ', '')}",
+              type="primary",
+              use_container_width=True,
+              key=f"v59_draw_main_{tid}",
+          ):
+            try:
+              exigir_backup_automatico(
+                  f"Sorteio chave principal {tid}",
+                  [
+                      ("Torneios", sheet_torneios),
+                      ("TorneioParticipantes", sheet_torneio_participantes),
+                      ("TorneioPartidas", sheet_torneio_partidas),
+                  ],
+              )
+              sortear_chave_principal_v59(tid)
+              registrar_log(
+                  st.session_state.get("admin_logado", "sistema"),
+                  f"Sorteou chave principal {tid}",
+              )
+              st.success("Chave principal sorteada.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+
+        _torneio_v59_controles_resultado(tid)
+
+    with tab_arena:
+      todos = obter_torneios_v58()
+      if not todos:
+        st.info("Nenhum torneio criado.")
+      else:
+        mapa = {
+            f"{t.get('Nome')} — {t.get('Status')}": t.get("TorneioID")
+            for t in todos
+        }
+        escolha = st.selectbox("Abrir torneio", list(mapa.keys()), key="v59_arena_t")
+        tid = mapa[escolha]
+        t = _torneio_por_id_v58(tid)
+        ps = _torneio_v59_participantes(tid)
+
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Inscritos", len(ps))
+        a2.metric("Status", t.get("Status", "-"))
+        a3.metric("Visibilidade", t.get("Visibilidade", "-"))
+        st.markdown(f"**CVs:** {t.get('CVsPermitidos', '-')}")
+        if str(t.get("Descricao", "")).strip():
+          st.write(t.get("Descricao"))
+        if str(t.get("YoutubeURL", "")).strip():
+          st.markdown(f"📺 **Transmissão:** {t.get('YoutubeURL')}")
+        _torneio_v59_render_chave(tid)
+
+    with tab_pub:
+      todos = obter_torneios_v58()
+      if not todos:
+        st.info("Nenhum torneio criado.")
+      else:
+        mapa = {t.get("Nome"): t.get("TorneioID") for t in todos}
+        escolha = st.selectbox("Torneio", list(mapa.keys()), key="v59_pub_t")
+        tid = mapa[escolha]
+        t = _torneio_por_id_v58(tid)
+
+        atual = str(t.get("Visibilidade", "")).upper() == "PUBLICO"
+        novo = st.toggle(
+            "🌐 Liberar Arena para usuários comuns",
+            value=atual,
+            key=f"v59_pub_vis_{tid}",
+        )
+        if novo != atual:
+          definir_visibilidade_torneio_v58(tid, novo)
+          _torneio_v59_limpar_cache()
+          st.success("Visibilidade atualizada.")
+          st.rerun()
+
+        youtube = st.text_input(
+            "📺 Link do YouTube",
+            value=str(t.get("YoutubeURL", "") or ""),
+            key=f"v59_pub_yt_{tid}",
+        )
+        obs = st.text_area(
+            "Informações públicas",
+            value=str(t.get("Observacoes", "") or ""),
+            key=f"v59_pub_obs_{tid}",
+        )
+        if st.button(
+            "💾 Salvar publicação",
+            use_container_width=True,
+            key=f"v59_pub_save_{tid}",
+        ):
+          atualizar_dados_torneio_v58(tid, youtube, obs)
+          _torneio_v59_limpar_cache()
+          st.success("Informações salvas.")
+          st.rerun()
+
+  else:
+    publicos = [
+        t for t in obter_torneios_v58()
+        if str(t.get("Visibilidade", "")).upper() == "PUBLICO"
+    ]
+    mapa = {
+        f"{t.get('Nome')} — {t.get('Status')}": t.get("TorneioID")
+        for t in publicos
+    }
+    escolha = st.selectbox("🏟️ Torneio", list(mapa.keys()), key="v59_pub_view")
+    tid = mapa[escolha]
+    t = _torneio_por_id_v58(tid)
+    ps = _torneio_v59_participantes(tid)
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Inscritos", len(ps))
+    a2.metric("Status", t.get("Status", "-"))
+    a3.metric("Formato", t.get("Formato", "1x1"))
+
+    if str(t.get("Descricao", "")).strip():
+      st.write(t.get("Descricao"))
+    st.markdown(f"**CVs permitidos:** {t.get('CVsPermitidos', '-')}")
+    if str(t.get("YoutubeURL", "")).strip():
+      st.markdown(f"📺 **Transmissão:** {t.get('YoutubeURL')}")
+    if str(t.get("Observacoes", "")).strip():
+      st.info(str(t.get("Observacoes")))
+
+    with st.expander("👥 Participantes"):
+      if ps:
+        dfp = pd.DataFrame(ps)
+        cols = [c for c in ["Nome", "CentroVila", "Status"] if c in dfp.columns]
+        st.dataframe(dfp[cols], use_container_width=True, hide_index=True)
+
+    _torneio_v59_render_chave(tid)
+
+
 def renderizar_gestao_20(df_rank, colunas_guerras, colunas_liga, colunas_raides):
   st.markdown("### 🚀 Central de Gestão 2.0")
   st.caption(f"Nível de acesso: **{nivel_admin_atual()}**")
@@ -7504,6 +8638,21 @@ elif st.session_state["pagina_atual"] == "novidades":
   renderizar_pagina_novidades()
 elif st.session_state["pagina_atual"] == "regras_cla":
   renderizar_regras_cla()
+elif st.session_state["pagina_atual"] == "torneios":
+  pode_ver_torneios_v59 = (
+      "admin_logado" in st.session_state
+      or any(
+          str(t.get("Visibilidade", "") or "").strip().upper() == "PUBLICO"
+          for t in obter_torneios_nav_v59()
+      )
+  )
+  if pode_ver_torneios_v59:
+    renderizar_torneios_v59()
+  else:
+    st.warning("A Arena de Torneios está oculta no momento.")
+    if st.button("⬅️ Voltar ao início", key="v59_hidden_back"):
+      st.session_state["pagina_atual"] = "principal"
+      st.rerun()
 
 # ==============================================================================
 # PÁGINA PRINCIPAL
@@ -7700,30 +8849,15 @@ else:
   # ABAS DESTACADAS DA PÁGINA PRINCIPAL
   st.write("")
 
-  mostrar_torneios_v58 = torneios_visiveis_para_usuario_v58()
-
-  if mostrar_torneios_v58:
-    tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_torneios, tab_admin = st.tabs(
-        [
-            "🏆 Ranking ao Vivo",
-            "📋 Tabela Detalhada",
-            "👤 Meu Perfil",
-            "📅 Agenda",
-            "⚔️ Torneios",
-            "🔐 Painel Admin",
-        ]
-    )
-  else:
-    tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_admin = st.tabs(
-        [
-            "🏆 Ranking ao Vivo",
-            "📋 Tabela Detalhada",
-            "👤 Meu Perfil",
-            "📅 Agenda",
-            "🔐 Painel Admin",
-        ]
-    )
-    tab_torneios = None
+  tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_admin = st.tabs(
+      [
+          "🏆 Ranking ao Vivo",
+          "📋 Tabela Detalhada",
+          "👤 Meu Perfil",
+          "📅 Agenda",
+          "🔐 Painel Admin",
+      ]
+  )
 
   # ABA 1: RANKING AO VIVO
   with tab_ranking:
@@ -8156,11 +9290,6 @@ else:
     renderizar_agenda_membros()
 
   # ABA 5: ÁREA ADMIN
-  # PÁGINA DE TORNEIOS — ADMIN OU LIBERADA AO PÚBLICO
-  if tab_torneios is not None:
-    with tab_torneios:
-      renderizar_torneios_v58()
-
   with tab_admin:
     st.subheader("🔐 Painel de Controle e Administração")
 
