@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v51 HOMOLOGAÇÃO - base v50 + elegibilidade do Passe exclusiva do clã principal.
+# Winning Wars v52 HOMOLOGAÇÃO - base v51 + prévia de Guerra Normal e Liga via API Supercell.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -3304,8 +3304,8 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v51)
-# Gestão dos dois clãs + elegibilidade do Passe. Vastaya não participa da competição.
+# SUPERCELL API - HOMOLOGAÇÃO (v52)
+# Gestão dos dois clãs + elegibilidade do Passe + prévia de guerras e Liga. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
   tag = str(valor or "").strip().upper().replace(" ", "")
@@ -3938,6 +3938,465 @@ def montar_comparacao_dois_clas(dados_principal, dados_secundario, df_local):
   return pd.DataFrame(linhas)
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _supercell_api_get(endpoint: str):
+  url = f"https://api.clashofclans.com/v1{endpoint}"
+  resposta = requests.get(
+      url,
+      headers=_supercell_headers_api(),
+      timeout=25,
+  )
+  if resposta.status_code != 200:
+    detalhe = resposta.text[:1000]
+    raise RuntimeError(
+        f"Supercell retornou HTTP {resposta.status_code}: {detalhe}"
+    )
+  return resposta.json()
+
+
+def consultar_guerra_atual_supercell():
+  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  if not clan_tag:
+    raise RuntimeError("O clã principal não está configurado.")
+  return _supercell_api_get(
+      f"/clans/{quote(clan_tag, safe='')}/currentwar"
+  )
+
+
+def consultar_grupo_liga_supercell():
+  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  if not clan_tag:
+    raise RuntimeError("O clã principal não está configurado.")
+  return _supercell_api_get(
+      f"/clans/{quote(clan_tag, safe='')}/currentwar/leaguegroup"
+  )
+
+
+def consultar_guerra_liga_supercell(war_tag: str):
+  tag = _supercell_normalizar_tag(war_tag)
+  if not tag:
+    raise RuntimeError("WarTag da Liga inválida.")
+  return _supercell_api_get(
+      f"/clanwarleagues/wars/{quote(tag, safe='')}"
+  )
+
+
+def _war_side_by_tag(war_data, clan_tag):
+  tag = _supercell_normalizar_tag(clan_tag)
+  clan = war_data.get("clan", {}) or {}
+  opponent = war_data.get("opponent", {}) or {}
+
+  if _supercell_normalizar_tag(clan.get("tag", "")) == tag:
+    return clan, opponent
+  if _supercell_normalizar_tag(opponent.get("tag", "")) == tag:
+    return opponent, clan
+  return None, None
+
+
+def _war_member_maps(war_data, clan_tag):
+  ours, enemy = _war_side_by_tag(war_data, clan_tag)
+  if ours is None:
+    return {}, {}, None, None
+
+  ours_map = {
+      _supercell_normalizar_tag(m.get("tag", "")): m
+      for m in (ours.get("members", []) or [])
+      if _supercell_normalizar_tag(m.get("tag", ""))
+  }
+  enemy_map = {
+      _supercell_normalizar_tag(m.get("tag", "")): m
+      for m in (enemy.get("members", []) or [])
+      if _supercell_normalizar_tag(m.get("tag", ""))
+  }
+  return ours_map, enemy_map, ours, enemy
+
+
+def calcular_pontos_ataque_v52(tipo_guerra, cv_atacante, cv_defensor, estrelas):
+  """Regras oficiais definidas para a competição do Passe na homologação."""
+  try:
+    cv_a = int(cv_atacante)
+  except Exception:
+    cv_a = 0
+  try:
+    cv_d = int(cv_defensor)
+  except Exception:
+    cv_d = 0
+  try:
+    stars = int(estrelas)
+  except Exception:
+    stars = 0
+
+  diferenca = cv_d - cv_a if cv_a and cv_d else None
+  tipo = str(tipo_guerra or "").strip().lower()
+
+  if tipo == "liga":
+    # Liga: não há penalidade por atacar abaixo.
+    # Contra CV maior: 2 estrelas valem 3; 3 estrelas valem 4.
+    if diferenca is not None and diferenca >= 1:
+      if stars == 2:
+        return 3, "⬆️ CV superior: 2⭐ → 3 pts"
+      if stars == 3:
+        return 4, "⬆️ CV superior: 3⭐ → 4 pts"
+    return stars, "Liga: estrelas reais"
+
+  # Guerra normal:
+  # mesmo CV ou 1 abaixo contam normalmente;
+  # 2+ CV abaixo não pontuam.
+  if diferenca is not None and diferenca <= -2:
+    return 0, "🚫 Alvo 2+ CV abaixo: não pontua"
+  return stars, "✅ Ataque válido"
+
+
+def montar_ataques_guerra_v52(war_data, tipo_guerra="Normal", war_tag=""):
+  principal_tag = _supercell_normalizar_tag(
+      st.secrets.get("supercell_clan_tag", "")
+  )
+  nossos, inimigos, nosso_cla, adversario = _war_member_maps(
+      war_data, principal_tag
+  )
+
+  if nosso_cla is None:
+    return pd.DataFrame(), {}
+
+  adversario_nome = str(adversario.get("name", "Adversário") or "Adversário")
+  adversario_tag = _supercell_normalizar_tag(adversario.get("tag", ""))
+  start_time = str(war_data.get("startTime", "") or "")
+  end_time = str(war_data.get("endTime", "") or "")
+  state = str(war_data.get("state", "") or "")
+  tipo_label = "Liga" if str(tipo_guerra).lower() == "liga" else "Guerra Normal"
+
+  war_id = (
+      _supercell_normalizar_tag(war_tag)
+      if war_tag
+      else f"{adversario_tag}|{start_time}"
+  )
+
+  linhas = []
+
+  for atacante_tag, atacante in nossos.items():
+    nome_atacante = str(atacante.get("name", "") or "")
+    cv_atacante = atacante.get("townhallLevel", atacante.get("townHallLevel", ""))
+    ataques = atacante.get("attacks", []) or []
+
+    for posicao_ataque, ataque in enumerate(ataques, start=1):
+      defensor_tag = _supercell_normalizar_tag(ataque.get("defenderTag", ""))
+      defensor = inimigos.get(defensor_tag, {})
+      nome_defensor = str(defensor.get("name", "") or "")
+      cv_defensor = defensor.get("townhallLevel", defensor.get("townHallLevel", ""))
+      estrelas = ataque.get("stars", 0)
+      destruicao = ataque.get("destructionPercentage", 0)
+
+      pontos, regra = calcular_pontos_ataque_v52(
+          tipo_guerra,
+          cv_atacante,
+          cv_defensor,
+          estrelas,
+      )
+
+      try:
+        diferenca_cv = int(cv_defensor) - int(cv_atacante)
+      except Exception:
+        diferenca_cv = ""
+
+      if diferenca_cv == "":
+        classificacao = "CV não identificado"
+      elif diferenca_cv > 0:
+        classificacao = f"⬆️ +{diferenca_cv} CV"
+      elif diferenca_cv == 0:
+        classificacao = "✅ Mesmo CV"
+      elif diferenca_cv == -1:
+        classificacao = "↘️ 1 CV abaixo"
+      else:
+        classificacao = f"🚫 {abs(diferenca_cv)} CV abaixo"
+
+      linhas.append({
+          "Guerra": f"vs {adversario_nome}",
+          "Tipo": tipo_label,
+          "WarID": war_id,
+          "Adversario": adversario_nome,
+          "AdversarioTag": adversario_tag,
+          "Inicio": start_time,
+          "Estado": state,
+          "PlayerTag": atacante_tag,
+          "Atacante": nome_atacante,
+          "CV Atacante": cv_atacante,
+          "Ataque": posicao_ataque,
+          "Defensor": nome_defensor,
+          "DefensorTag": defensor_tag,
+          "CV Defensor": cv_defensor,
+          "Diferença CV": diferenca_cv,
+          "Classificação": classificacao,
+          "Estrelas": estrelas,
+          "Destruição %": destruicao,
+          "Pontos Passe": pontos,
+          "Regra aplicada": regra,
+          "ClanTagOrigem": principal_tag,
+      })
+
+  meta = {
+      "adversario_nome": adversario_nome,
+      "adversario_tag": adversario_tag,
+      "inicio": start_time,
+      "fim": end_time,
+      "estado": state,
+      "tipo": tipo_label,
+      "war_id": war_id,
+      "nossos_ataques": len(linhas),
+      "nosso_nome": str(nosso_cla.get("name", "Winning Wars") or "Winning Wars"),
+  }
+  return pd.DataFrame(linhas), meta
+
+
+def resumir_pontos_guerra_v52(df_ataques):
+  if df_ataques is None or df_ataques.empty:
+    return pd.DataFrame()
+
+  resumo = (
+      df_ataques
+      .groupby(["WarID", "Guerra", "Tipo", "PlayerTag", "Atacante"], as_index=False)
+      .agg(
+          Ataques=("Ataque", "count"),
+          Estrelas_Reais=("Estrelas", "sum"),
+          Pontos_Passe=("Pontos Passe", "sum"),
+      )
+  )
+  return resumo.sort_values(
+      ["Guerra", "Pontos_Passe", "Estrelas_Reais"],
+      ascending=[True, False, False],
+  )
+
+
+def buscar_guerras_liga_v52():
+  grupo = consultar_grupo_liga_supercell()
+  principal_tag = _supercell_normalizar_tag(
+      st.secrets.get("supercell_clan_tag", "")
+  )
+
+  war_tags = []
+  for rodada in grupo.get("rounds", []) or []:
+    for tag in rodada.get("warTags", []) or []:
+      tag_norm = _supercell_normalizar_tag(tag)
+      if tag_norm and tag_norm not in {"#0", "#"}:
+        war_tags.append(tag_norm)
+
+  # remove duplicações mantendo ordem
+  war_tags = list(dict.fromkeys(war_tags))
+
+  guerras = []
+  erros = []
+  for war_tag in war_tags:
+    try:
+      guerra = consultar_guerra_liga_supercell(war_tag)
+      nosso_cla, _ = _war_side_by_tag(guerra, principal_tag)
+      if nosso_cla is not None:
+        guerras.append((war_tag, guerra))
+    except Exception as exc:
+      erros.append(f"{war_tag}: {exc}")
+
+  return grupo, guerras, erros
+
+
+def renderizar_previa_guerras_v52():
+  st.markdown("#### 4️⃣ Prévia de Guerras — regras do Passe")
+  st.info(
+      "🧪 Esta área é **somente leitura**. Ela consulta ataques e calcula a pontuação "
+      "que seria aplicada, mas **não grava pontos** na Tabela Geral."
+  )
+
+  regra1, regra2 = st.columns(2)
+  with regra1:
+    st.markdown(
+        "**⚔️ Guerra Normal**\n\n"
+        "- Mesmo CV: estrelas normais\n"
+        "- 1 CV abaixo: estrelas normais\n"
+        "- 2+ CV abaixo: **0 ponto**"
+    )
+  with regra2:
+    st.markdown(
+        "**🏆 Liga de Clãs**\n\n"
+        "- Mesmo CV ou abaixo: estrelas normais\n"
+        "- CV superior + 2⭐: **3 pontos**\n"
+        "- CV superior + 3⭐: **4 pontos**"
+    )
+
+  st.caption(
+      "Todas as estrelas do ataque são consideradas individualmente, mesmo quando "
+      "o alvo já possuía estrelas de ataques anteriores."
+  )
+
+  normal_tab, liga_tab = st.tabs(["⚔️ Guerra atual", "🏆 Liga de Clãs"])
+
+  with normal_tab:
+    if st.button(
+        "🔎 Ler guerra atual do Winning Wars",
+        use_container_width=True,
+        key="v52_ler_guerra_atual",
+    ):
+      try:
+        _supercell_api_get.clear()
+        with st.spinner("Consultando a guerra atual..."):
+          guerra = consultar_guerra_atual_supercell()
+          ataques, meta = montar_ataques_guerra_v52(
+              guerra,
+              tipo_guerra="Normal",
+          )
+
+        st.session_state["v52_guerra_normal"] = guerra
+        st.session_state["v52_ataques_normal"] = ataques
+        st.session_state["v52_meta_normal"] = meta
+      except Exception as exc:
+        st.error("❌ Não foi possível consultar a guerra atual.")
+        st.exception(exc)
+
+    meta = st.session_state.get("v52_meta_normal")
+    ataques = st.session_state.get("v52_ataques_normal")
+
+    if meta:
+      st.markdown(
+          f"##### ⚔️ {meta.get('nosso_nome', 'Winning Wars')} "
+          f"x {meta.get('adversario_nome', 'Adversário')}"
+      )
+      a1, a2, a3 = st.columns(3)
+      a1.metric("Estado", meta.get("estado", "-"))
+      a2.metric("Ataques lidos", meta.get("nossos_ataques", 0))
+      a3.metric("Adversário", meta.get("adversario_nome", "-"))
+
+      if ataques is not None and not ataques.empty:
+        resumo = resumir_pontos_guerra_v52(ataques)
+        st.markdown("##### 📊 Resumo por jogador")
+        st.dataframe(
+            resumo[[
+                "Atacante", "PlayerTag", "Ataques",
+                "Estrelas_Reais", "Pontos_Passe"
+            ]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Ver cada ataque e a regra aplicada", expanded=False):
+          st.dataframe(
+              ataques[[
+                  "Atacante", "PlayerTag", "CV Atacante",
+                  "Defensor", "CV Defensor", "Classificação",
+                  "Estrelas", "Destruição %", "Pontos Passe",
+                  "Regra aplicada"
+              ]],
+              use_container_width=True,
+              hide_index=True,
+          )
+      else:
+        st.warning(
+            "A guerra foi localizada, mas ainda não há ataques disponíveis para calcular."
+        )
+
+  with liga_tab:
+    if st.button(
+        "🔎 Ler guerras da Liga do Winning Wars",
+        use_container_width=True,
+        key="v52_ler_liga",
+    ):
+      try:
+        _supercell_api_get.clear()
+        with st.spinner("Consultando o grupo e as rodadas da Liga..."):
+          grupo, guerras, erros = buscar_guerras_liga_v52()
+
+          tabelas = []
+          metas = []
+          for war_tag, guerra in guerras:
+            df_war, meta_war = montar_ataques_guerra_v52(
+                guerra,
+                tipo_guerra="Liga",
+                war_tag=war_tag,
+            )
+            metas.append(meta_war)
+            if not df_war.empty:
+              tabelas.append(df_war)
+
+          todos_ataques = (
+              pd.concat(tabelas, ignore_index=True)
+              if tabelas else pd.DataFrame()
+          )
+
+        st.session_state["v52_liga_grupo"] = grupo
+        st.session_state["v52_liga_metas"] = metas
+        st.session_state["v52_ataques_liga"] = todos_ataques
+        st.session_state["v52_liga_erros"] = erros
+      except Exception as exc:
+        st.error("❌ Não foi possível consultar a Liga.")
+        st.exception(exc)
+
+    metas = st.session_state.get("v52_liga_metas", [])
+    ataques_liga = st.session_state.get("v52_ataques_liga")
+    erros = st.session_state.get("v52_liga_erros", [])
+
+    if metas:
+      st.markdown(f"##### 🏆 Guerras do Winning Wars encontradas: {len(metas)}")
+      df_guerras = pd.DataFrame([
+          {
+              "Guerra": f"vs {m.get('adversario_nome', '-')}",
+              "AdversarioTag": m.get("adversario_tag", ""),
+              "Estado": m.get("estado", ""),
+              "Ataques lidos": m.get("nossos_ataques", 0),
+              "WarID": m.get("war_id", ""),
+          }
+          for m in metas
+      ])
+      st.dataframe(df_guerras, use_container_width=True, hide_index=True)
+
+    if ataques_liga is not None and not ataques_liga.empty:
+      resumo_liga = resumir_pontos_guerra_v52(ataques_liga)
+
+      st.markdown("##### 📊 Pontuação calculada por jogador e guerra")
+      st.dataframe(
+          resumo_liga[[
+              "Guerra", "Atacante", "PlayerTag",
+              "Ataques", "Estrelas_Reais", "Pontos_Passe"
+          ]],
+          use_container_width=True,
+          hide_index=True,
+      )
+
+      st.markdown("##### 🏅 Total provisório da Liga por jogador")
+      total_liga = (
+          ataques_liga
+          .groupby(["PlayerTag", "Atacante"], as_index=False)
+          .agg(
+              Ataques=("Ataque", "count"),
+              Estrelas_Reais=("Estrelas", "sum"),
+              Pontos_Passe=("Pontos Passe", "sum"),
+          )
+          .sort_values(["Pontos_Passe", "Estrelas_Reais"], ascending=False)
+      )
+      st.dataframe(total_liga, use_container_width=True, hide_index=True)
+
+      with st.expander("Ver todos os ataques da Liga", expanded=False):
+        st.dataframe(
+            ataques_liga[[
+                "Guerra", "Atacante", "CV Atacante",
+                "Defensor", "CV Defensor", "Classificação",
+                "Estrelas", "Destruição %", "Pontos Passe",
+                "Regra aplicada"
+            ]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if erros:
+      st.warning(
+          "Algumas WarTags não puderam ser consultadas. "
+          "As demais guerras foram mantidas na prévia."
+      )
+      with st.expander("Detalhes das WarTags com erro"):
+        for erro in erros:
+          st.code(erro)
+
+  st.caption(
+      "🔒 Nesta v52 nenhuma coluna Guerra_* ou Liga_* é atualizada automaticamente. "
+      "O objetivo é validar os dados da API e as regras antes de liberar gravação."
+  )
+
+
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
@@ -4121,6 +4580,9 @@ def renderizar_integracao_supercell():
     except Exception as exc:
       st.error("❌ Não foi possível realizar a importação inicial.")
       st.exception(exc)
+
+  st.divider()
+  renderizar_previa_guerras_v52()
 
   st.divider()
   st.markdown("#### 📜 Histórico de movimentações")
