@@ -9,6 +9,7 @@ import requests
 from io import BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 import gspread
 import pandas as pd
 import streamlit as st
@@ -68,112 +69,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-import requests
 
-try:
-    ip_saida = requests.get(
-        "https://api.ipify.org",
-        timeout=10
-    ).text.strip()
-
-    st.info(f"🌐 IP público de saída do servidor: {ip_saida}")
-
-except Exception as e:
-    st.error(f"Não foi possível descobrir o IP: {e}")
-
-from urllib.parse import quote
-
-def supercell_headers():
-    token = str(
-        st.secrets.get("supercell_api_token", "")
-    ).strip()
-
-    if not token:
-        raise RuntimeError(
-            "O Secret 'supercell_api_token' não foi configurado."
-        )
-
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-
-def consultar_cla_supercell():
-    clan_tag = str(
-        st.secrets.get("supercell_clan_tag", "")
-    ).strip()
-
-    if not clan_tag:
-        raise RuntimeError(
-            "O Secret 'supercell_clan_tag' não foi configurado."
-        )
-
-    tag_codificada = quote(clan_tag, safe="")
-
-    url = (
-        "https://api.clashofclans.com/v1/clans/"
-        f"{tag_codificada}"
-    )
-
-    resposta = requests.get(
-        url,
-        headers=supercell_headers(),
-        timeout=20,
-    )
-
-    if resposta.status_code != 200:
-        raise RuntimeError(
-            f"Supercell retornou HTTP {resposta.status_code}: "
-            f"{resposta.text}"
-        )
-
-    return resposta.json()
-
-
-st.markdown("### 🧪 Teste da API Supercell")
-
-if st.button("🔄 Testar conexão com a Supercell"):
-    try:
-        dados_cla = consultar_cla_supercell()
-
-        st.success("✅ Conexão com a API da Supercell realizada com sucesso!")
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Clã",
-            dados_cla.get("name", "-")
-        )
-
-        col2.metric(
-            "Nível",
-            dados_cla.get("clanLevel", "-")
-        )
-
-        col3.metric(
-            "Membros",
-            dados_cla.get("members", "-")
-        )
-
-        st.write(
-            "**Tag:**",
-            dados_cla.get("tag", "-")
-        )
-
-        st.write(
-            "**Pontos do clã:**",
-            dados_cla.get("clanPoints", "-")
-        )
-
-        st.write(
-            "**Liga:**",
-            dados_cla.get("warLeague", {}).get("name", "-")
-        )
-
-    except Exception as e:
-        st.error("❌ Falha na comunicação com a Supercell.")
-        st.exception(e)
 # --- PWA / ÍCONE PARA IPHONE, IPAD E ANDROID ---
 # O favicon continua configurado em st.set_page_config.
 # Para instalação na Tela de Início, reforçamos apple-touch-icon,
@@ -3383,6 +3279,228 @@ def renderizar_agenda_membros():
     st.divider()
 
 
+# ==============================================================================
+# SUPERCELL API - HOMOLOGAÇÃO (v48)
+# Leitura e comparação somente. Não altera pontuações nem grava dados na planilha.
+# ==============================================================================
+def _supercell_normalizar_tag(valor: str) -> str:
+  tag = str(valor or "").strip().upper().replace(" ", "")
+  if tag and not tag.startswith("#"):
+    tag = "#" + tag
+  return tag
+
+
+def _supercell_normalizar_nome(valor: str) -> str:
+  return re.sub(r"\\s+", " ", str(valor or "").strip()).casefold()
+
+
+def supercell_configurada() -> bool:
+  return bool(
+      str(st.secrets.get("supercell_api_token", "")).strip()
+      and str(st.secrets.get("supercell_clan_tag", "")).strip()
+  )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def consultar_cla_supercell():
+  token = str(st.secrets.get("supercell_api_token", "")).strip()
+  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+
+  if not token:
+    raise RuntimeError("O Secret 'supercell_api_token' não foi configurado.")
+  if not clan_tag:
+    raise RuntimeError("O Secret 'supercell_clan_tag' não foi configurado.")
+
+  url = f"https://api.clashofclans.com/v1/clans/{quote(clan_tag, safe='')}"
+  resposta = requests.get(
+      url,
+      headers={
+          "Authorization": f"Bearer {token}",
+          "Accept": "application/json",
+      },
+      timeout=20,
+  )
+
+  if resposta.status_code != 200:
+    detalhe = resposta.text[:800]
+    raise RuntimeError(
+        f"Supercell retornou HTTP {resposta.status_code}: {detalhe}"
+    )
+
+  return resposta.json()
+
+
+def montar_comparacao_membros_supercell(dados_cla, df_local):
+  membros_api = dados_cla.get("memberList", []) or []
+  local = df_local.copy() if df_local is not None else pd.DataFrame()
+
+  possui_nome = "Nome" in local.columns
+  possui_tag = "PlayerTag" in local.columns
+
+  por_tag = {}
+  por_nome = {}
+  if not local.empty and possui_nome:
+    for idx, row in local.iterrows():
+      nome = str(row.get("Nome", "") or "").strip()
+      tag = _supercell_normalizar_tag(row.get("PlayerTag", "")) if possui_tag else ""
+      registro = {"indice": idx, "nome": nome, "tag": tag}
+      if tag:
+        por_tag[tag] = registro
+      if nome:
+        por_nome.setdefault(_supercell_normalizar_nome(nome), registro)
+
+  vistos_local = set()
+  linhas = []
+
+  for membro in membros_api:
+    tag = _supercell_normalizar_tag(membro.get("tag", ""))
+    nome = str(membro.get("name", "") or "").strip()
+    correspondencia = None
+    status = "🆕 Novo no clã / não encontrado na planilha"
+    criterio = "Nenhum"
+
+    if tag and tag in por_tag:
+      correspondencia = por_tag[tag]
+      status = "✅ Vinculado por PlayerTag"
+      criterio = "PlayerTag"
+    else:
+      nome_norm = _supercell_normalizar_nome(nome)
+      if nome_norm and nome_norm in por_nome:
+        correspondencia = por_nome[nome_norm]
+        if possui_tag and correspondencia.get("tag"):
+          status = "⚠️ Nome igual, mas PlayerTag diferente"
+        else:
+          status = "🟡 Nome correspondente — falta vincular PlayerTag"
+        criterio = "Nome"
+
+    if correspondencia is not None:
+      vistos_local.add(correspondencia["indice"])
+
+    linhas.append({
+        "Status": status,
+        "Nome Supercell": nome,
+        "PlayerTag": tag,
+        "Nome na planilha": correspondencia.get("nome", "") if correspondencia else "",
+        "Tag na planilha": correspondencia.get("tag", "") if correspondencia else "",
+        "Critério": criterio,
+        "Cargo": membro.get("role", ""),
+        "Nível XP": membro.get("expLevel", ""),
+        "Troféus": membro.get("trophies", ""),
+        "Doações": membro.get("donations", ""),
+        "Recebidas": membro.get("donationsReceived", ""),
+    })
+
+  if not local.empty and possui_nome:
+    for idx, row in local.iterrows():
+      if idx in vistos_local:
+        continue
+      nome_local = str(row.get("Nome", "") or "").strip()
+      if not nome_local:
+        continue
+      tag_local = _supercell_normalizar_tag(row.get("PlayerTag", "")) if possui_tag else ""
+      linhas.append({
+          "Status": "⚪ Está na planilha, mas não aparece no clã",
+          "Nome Supercell": "",
+          "PlayerTag": "",
+          "Nome na planilha": nome_local,
+          "Tag na planilha": tag_local,
+          "Critério": "Somente planilha",
+          "Cargo": "",
+          "Nível XP": "",
+          "Troféus": "",
+          "Doações": "",
+          "Recebidas": "",
+      })
+
+  return pd.DataFrame(linhas)
+
+
+def renderizar_integracao_supercell():
+  st.markdown("### 🛡️ Integração Supercell")
+  st.caption(
+      "Homologação: esta área consulta e compara os membros do clã. "
+      "Nenhuma pontuação é alterada e nenhum dado é gravado automaticamente."
+  )
+
+  if not supercell_configurada():
+    st.error(
+        "Configure 'supercell_api_token' e 'supercell_clan_tag' nos Secrets do Streamlit."
+    )
+    return
+
+  clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  st.info(f"Clã configurado: **{clan_tag}**")
+
+  if st.button(
+      "🔄 Sincronizar membros",
+      type="primary",
+      use_container_width=True,
+      key="supercell_sincronizar_membros",
+  ):
+    try:
+      consultar_cla_supercell.clear()
+      with st.spinner("Consultando a API oficial da Supercell..."):
+        dados_cla = consultar_cla_supercell()
+        comparacao = montar_comparacao_membros_supercell(dados_cla, df)
+
+      st.session_state["supercell_dados_cla"] = dados_cla
+      st.session_state["supercell_comparacao"] = comparacao
+      st.session_state["supercell_ultima_sync"] = data_hora_postagem()
+      st.success("✅ Membros consultados e comparados com a planilha de homologação.")
+    except Exception as exc:
+      st.error("❌ Não foi possível sincronizar os membros com a Supercell.")
+      st.exception(exc)
+      return
+
+  dados_cla = st.session_state.get("supercell_dados_cla")
+  comparacao = st.session_state.get("supercell_comparacao")
+
+  if not dados_cla or comparacao is None:
+    st.warning(
+        "Clique em **Sincronizar membros** para carregar a primeira comparação."
+    )
+    return
+
+  c1, c2, c3, c4 = st.columns(4)
+  c1.metric("Clã", dados_cla.get("name", "-"))
+  c2.metric("Nível", dados_cla.get("clanLevel", "-"))
+  c3.metric("Membros API", dados_cla.get("members", len(dados_cla.get("memberList", []))))
+  c4.metric("Última sincronização", st.session_state.get("supercell_ultima_sync", "-"))
+
+  total_vinculados = int(comparacao["Status"].astype(str).str.startswith("✅").sum()) if not comparacao.empty else 0
+  total_nome = int(comparacao["Status"].astype(str).str.startswith("🟡").sum()) if not comparacao.empty else 0
+  total_novos = int(comparacao["Status"].astype(str).str.startswith("🆕").sum()) if not comparacao.empty else 0
+  total_fora = int(comparacao["Status"].astype(str).str.startswith("⚪").sum()) if not comparacao.empty else 0
+
+  m1, m2, m3, m4 = st.columns(4)
+  m1.metric("✅ Vinculados por tag", total_vinculados)
+  m2.metric("🟡 Correspondência por nome", total_nome)
+  m3.metric("🆕 Novos / não encontrados", total_novos)
+  m4.metric("⚪ Só na planilha", total_fora)
+
+  if "PlayerTag" not in df.columns:
+    st.warning(
+        "A planilha principal ainda não possui a coluna **PlayerTag**. "
+        "Por isso, nesta fase a comparação usa o nome como aproximação. "
+        "A v48 não cria essa coluna nem grava tags automaticamente."
+    )
+
+  st.markdown("#### 📋 Comparação Supercell × Google Sheets")
+  st.dataframe(
+      comparacao,
+      use_container_width=True,
+      hide_index=True,
+      column_config={
+          "PlayerTag": st.column_config.TextColumn("PlayerTag Supercell"),
+      },
+  )
+
+  st.caption(
+      "✅ = vínculo confiável por tag · 🟡 = nome igual, ainda sem tag vinculada · "
+      "🆕 = membro da Supercell não encontrado na planilha · ⚪ = registro local fora do clã."
+  )
+
+
 def renderizar_gestao_20(df_rank, colunas_guerras, colunas_liga, colunas_raides):
   st.markdown("### 🚀 Central de Gestão 2.0")
   st.caption(f"Nível de acesso: **{nivel_admin_atual()}**")
@@ -4321,8 +4439,9 @@ else:
           " Liberado)"
       )
 
-      sub_tab20, sub_tab1, sub_tab2, sub_tab_pass, sub_tab3, sub_tab4, sub_tab_news, sub_tab5, sub_tab6, sub_tab7 = st.tabs([
+      sub_tab20, sub_tab_supercell, sub_tab1, sub_tab2, sub_tab_pass, sub_tab3, sub_tab4, sub_tab_news, sub_tab5, sub_tab6, sub_tab7 = st.tabs([
           "🚀 Gestão 2.0",
+          "🛡️ Supercell",
           "➕ Players",
           "👤 Novo Admin",
           "🔑 Alterar Senha",
@@ -4336,6 +4455,9 @@ else:
 
       with sub_tab20:
         renderizar_gestao_20(df_rank, colunas_guerras, colunas_liga, colunas_raides)
+
+      with sub_tab_supercell:
+        renderizar_integracao_supercell()
 
       with sub_tab1:
         c1, c2 = st.columns(2)
