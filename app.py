@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v50 HOMOLOGAÇÃO - base v49 + gestão de movimentação Winning Wars/Vastaya por PlayerTag.
+# Winning Wars v51 HOMOLOGAÇÃO - base v50 + elegibilidade do Passe exclusiva do clã principal.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -852,6 +852,17 @@ def snapshot_ranking_atual(tipo="alteracao", detalhe=""):
     atual = pd.DataFrame(_ler_sheets_com_retry(sheet_dados.get_all_records))
     if atual.empty or "Nome" not in atual.columns:
       return
+    # v51: snapshots oficiais da competição incluem somente elegíveis ao passe.
+    if "ElegivelPasse" in atual.columns:
+      mask_elegivel = atual["ElegivelPasse"].astype(str).str.strip().str.upper().eq("SIM")
+      atual = atual[mask_elegivel].copy()
+    elif "StatusClan" in atual.columns:
+      mask_elegivel = atual["StatusClan"].astype(str).str.strip().eq("Principal")
+      atual = atual[mask_elegivel].copy()
+    else:
+      # Sem status Supercell não há elegibilidade verificável.
+      atual = atual.iloc[0:0].copy()
+
     cols = [c for c in atual.columns if c in ["JogosCla", "Eventos"] or c.startswith(("Guerra_", "Liga_", "Raide_"))]
     for c in cols:
       atual[c] = pd.to_numeric(atual[c], errors="coerce").fillna(0)
@@ -3293,8 +3304,8 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v50)
-# Gestão dos dois clãs, movimentações e importação oficial. Não altera pontuações.
+# SUPERCELL API - HOMOLOGAÇÃO (v51)
+# Gestão dos dois clãs + elegibilidade do Passe. Vastaya não participa da competição.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
   tag = str(valor or "").strip().upper().replace(" ", "")
@@ -3409,6 +3420,32 @@ def _supercell_horas_inatividade() -> int:
     return 48
 
 
+
+def player_elegivel_passe(registro) -> bool:
+  """Regra oficial da competição: somente players atualmente no clã principal."""
+  try:
+    elegivel = str(registro.get("ElegivelPasse", "") or "").strip().upper()
+  except Exception:
+    elegivel = ""
+
+  if elegivel:
+    return elegivel == "SIM"
+
+  # Compatibilidade com bases ainda não sincronizadas pela v51.
+  try:
+    status = str(registro.get("StatusClan", "") or "").strip()
+  except Exception:
+    status = ""
+  return status == "Principal"
+
+
+def contribuicao_elegivel_passe(clan_tag_origem: str) -> bool:
+  """Trava preparada para automações futuras: só eventos do Winning Wars contam."""
+  principal = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  origem = _supercell_normalizar_tag(clan_tag_origem)
+  return bool(principal and origem and origem == principal)
+
+
 def _supercell_coluna_eh_pontuacao(nome_coluna: str) -> bool:
   nome = str(nome_coluna or "").strip()
   return (
@@ -3431,6 +3468,7 @@ def _supercell_preparar_headers_importacao(headers_atuais):
       "Cargo",
       "NivelCV",
       "StatusClan",
+      "ElegivelPasse",
       "ClaAtual",
       "UltimaVezNoCla",
       "UltimaSincronizacao",
@@ -3583,6 +3621,7 @@ def importar_membros_supercell_base():
     registro["Cargo"] = str(membro.get("role", "") or "").strip()
     registro["NivelCV"] = membro.get("townHallLevel", "")
     registro["StatusClan"] = info["status"]
+    registro["ElegivelPasse"] = "SIM" if info["status"] == "Principal" else "NAO"
     registro["ClaAtual"] = info["cla"]
     registro["UltimaVezNoCla"] = agora
     registro["UltimaSincronizacao"] = agora
@@ -3716,6 +3755,7 @@ def sincronizar_movimentacao_supercell():
     registro["Cargo"] = str(membro.get("role", "") or "").strip()
     registro["NivelCV"] = membro.get("townHallLevel", "")
     registro["StatusClan"] = status_novo
+    registro["ElegivelPasse"] = "SIM" if status_novo == "Principal" else "NAO"
     registro["ClaAtual"] = cla_novo
     registro["UltimaVezNoCla"] = agora
     registro["UltimaSincronizacao"] = agora
@@ -3774,6 +3814,7 @@ def sincronizar_movimentacao_supercell():
       status_novo = "Inativo"
 
     registro["StatusClan"] = status_novo
+    registro["ElegivelPasse"] = "NAO"
     registro["ClaAtual"] = ""
     registro["UltimaSincronizacao"] = agora
 
@@ -3900,8 +3941,13 @@ def montar_comparacao_dois_clas(dados_principal, dados_secundario, df_local):
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
-      "v50 HOMOLOGAÇÃO: Winning Wars + Vastaya, identificação por PlayerTag, "
-      "movimentação entre clãs e janela de ausência. Nenhuma pontuação é alterada."
+      "v51 HOMOLOGAÇÃO: Winning Wars + Vastaya, identificação por PlayerTag, "
+      "movimentação entre clãs e elegibilidade automática do Passe."
+  )
+  st.info(
+      "🏆 Regra da competição: somente **StatusClan = Principal** recebe "
+      "**ElegivelPasse = SIM** e aparece no ranking/Tabela Geral. "
+      "Vastaya, Ausente temporário e Inativo ficam fora da premiação."
   )
 
   if not supercell_duplo_cla_configurado():
@@ -3972,7 +4018,7 @@ def renderizar_integracao_supercell():
 
   st.markdown("#### 2️⃣ Sincronizar movimentação")
   st.caption(
-      "Atualiza Nome, Cargo, CV, StatusClan, ClaAtual e datas por PlayerTag. "
+      "Atualiza Nome, Cargo, CV, StatusClan, ElegivelPasse, ClaAtual e datas por PlayerTag. "
       "Também inclui novos PlayerTags encontrados. Pontuações existentes são preservadas."
   )
 
@@ -4691,13 +4737,41 @@ else:
         ["JogosCla", "Eventos"] + colunas_raides + colunas_guerras + colunas_liga
     )
 
+    # Mantém o dataframe completo para administração e histórico.
     for col in colunas_pontos:
       if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     cols_somar = [c for c in colunas_pontos if c in df.columns]
     df["Total"] = df[cols_somar].sum(axis=1) if cols_somar else 0
-    df_rank = df.sort_values(by="Total", ascending=False).reset_index(drop=True)
+
+    # v51: a competição é exclusiva para membros atualmente no Winning Wars.
+    if "ElegivelPasse" in df.columns:
+      mask_competicao = (
+          df["ElegivelPasse"]
+          .astype(str)
+          .str.strip()
+          .str.upper()
+          .eq("SIM")
+      )
+    elif "StatusClan" in df.columns:
+      mask_competicao = (
+          df["StatusClan"]
+          .astype(str)
+          .str.strip()
+          .eq("Principal")
+      )
+    else:
+      # Sem vínculo Supercell, ninguém é considerado elegível automaticamente.
+      mask_competicao = pd.Series(False, index=df.index)
+
+    df_competicao = df[mask_competicao].copy()
+
+    df_rank = (
+        df_competicao
+        .sort_values(by="Total", ascending=False)
+        .reset_index(drop=True)
+    )
     df_rank.index = df_rank.index + 1
 
     posicoes = []
@@ -4713,6 +4787,7 @@ else:
     df_rank["Posição"] = posicoes
   else:
     colunas_raides, colunas_guerras, colunas_liga = [], [], []
+    df_competicao = pd.DataFrame()
     df_rank = pd.DataFrame()
 
   # ABAS DESTACADAS DA PÁGINA PRINCIPAL
@@ -4724,7 +4799,7 @@ else:
 
   # ABA 1: RANKING AO VIVO
   with tab_ranking:
-    if not df.empty and "Total" in df.columns:
+    if not df_rank.empty and "Total" in df_rank.columns:
       if mes_finalizado:
         st.success(
             "🔒 **O MÊS FOI FINALIZADO PELO ADMIN! CONFIRA OS CAMPEÕES:**"
@@ -4799,8 +4874,12 @@ else:
 
   # ABA 2: TABELA DETALHADA GERAL
   with tab_tabela:
-    if not df.empty and "Total" in df.columns:
+    if not df_competicao.empty and "Total" in df_competicao.columns:
       st.markdown("### 📋 Tabela Detalhada Geral de Pontuações")
+      st.caption(
+          "🏆 Elegibilidade do Passe: somente membros atualmente no Winning Wars "
+          "(StatusClan = Principal / ElegivelPasse = SIM)."
+      )
       st.markdown(
           "Acompanhe os pontos por atividade. No celular, **Nome** e **Total** "
           "permanecem fixos enquanto você desliza para visualizar as atividades."
@@ -4814,7 +4893,7 @@ else:
           + colunas_raides
           + ["Total"]
       )
-      df_detalhada = df[cols_exibicao].sort_values(
+      df_detalhada = df_competicao[cols_exibicao].sort_values(
           by="Total", ascending=False
       ).reset_index(drop=True)
 
