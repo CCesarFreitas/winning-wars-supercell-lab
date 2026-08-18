@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v53 HOMOLOGAÇÃO - base v52 + prévia de Raides da Capital e regras do Passe.
+# Winning Wars v53.2 HOMOLOGAÇÃO - correção da pontuação dos Raides: 1 ponto por ataque + bônus Top 3.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -3968,9 +3968,31 @@ def consultar_grupo_liga_supercell():
   clan_tag = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
   if not clan_tag:
     raise RuntimeError("O clã principal não está configurado.")
-  return _supercell_api_get(
-      f"/clans/{quote(clan_tag, safe='')}/currentwar/leaguegroup"
+
+  endpoint = f"/clans/{quote(clan_tag, safe='')}/currentwar/leaguegroup"
+  url = f"https://api.clashofclans.com/v1{endpoint}"
+
+  resposta = requests.get(
+      url,
+      headers=_supercell_headers_api(),
+      timeout=25,
   )
+
+  if resposta.status_code == 404:
+    try:
+      payload = resposta.json()
+    except Exception:
+      payload = {}
+    if str(payload.get("reason", "")).strip() == "notFound":
+      return None
+
+  if resposta.status_code != 200:
+    detalhe = resposta.text[:1000]
+    raise RuntimeError(
+        f"Supercell retornou HTTP {resposta.status_code}: {detalhe}"
+    )
+
+  return resposta.json()
 
 
 def consultar_guerra_liga_supercell(war_tag: str):
@@ -4169,6 +4191,10 @@ def resumir_pontos_guerra_v52(df_ataques):
 
 def buscar_guerras_liga_v52():
   grupo = consultar_grupo_liga_supercell()
+
+  if grupo is None:
+    return None, [], []
+
   principal_tag = _supercell_normalizar_tag(
       st.secrets.get("supercell_clan_tag", "")
   )
@@ -4301,27 +4327,35 @@ def renderizar_previa_guerras_v52():
         with st.spinner("Consultando o grupo e as rodadas da Liga..."):
           grupo, guerras, erros = buscar_guerras_liga_v52()
 
-          tabelas = []
-          metas = []
-          for war_tag, guerra in guerras:
-            df_war, meta_war = montar_ataques_guerra_v52(
-                guerra,
-                tipo_guerra="Liga",
-                war_tag=war_tag,
+          if grupo is None:
+            st.session_state["v52_liga_grupo"] = None
+            st.session_state["v52_liga_metas"] = []
+            st.session_state["v52_ataques_liga"] = pd.DataFrame()
+            st.session_state["v52_liga_erros"] = []
+            st.session_state["v52_liga_sem_ativa"] = True
+          else:
+            tabelas = []
+            metas = []
+            for war_tag, guerra in guerras:
+              df_war, meta_war = montar_ataques_guerra_v52(
+                  guerra,
+                  tipo_guerra="Liga",
+                  war_tag=war_tag,
+              )
+              metas.append(meta_war)
+              if not df_war.empty:
+                tabelas.append(df_war)
+
+            todos_ataques = (
+                pd.concat(tabelas, ignore_index=True)
+                if tabelas else pd.DataFrame()
             )
-            metas.append(meta_war)
-            if not df_war.empty:
-              tabelas.append(df_war)
 
-          todos_ataques = (
-              pd.concat(tabelas, ignore_index=True)
-              if tabelas else pd.DataFrame()
-          )
-
-        st.session_state["v52_liga_grupo"] = grupo
-        st.session_state["v52_liga_metas"] = metas
-        st.session_state["v52_ataques_liga"] = todos_ataques
-        st.session_state["v52_liga_erros"] = erros
+            st.session_state["v52_liga_grupo"] = grupo
+            st.session_state["v52_liga_metas"] = metas
+            st.session_state["v52_ataques_liga"] = todos_ataques
+            st.session_state["v52_liga_erros"] = erros
+            st.session_state["v52_liga_sem_ativa"] = False
       except Exception as exc:
         st.error("❌ Não foi possível consultar a Liga.")
         st.exception(exc)
@@ -4329,6 +4363,14 @@ def renderizar_previa_guerras_v52():
     metas = st.session_state.get("v52_liga_metas", [])
     ataques_liga = st.session_state.get("v52_ataques_liga")
     erros = st.session_state.get("v52_liga_erros", [])
+    sem_liga_ativa = st.session_state.get("v52_liga_sem_ativa", False)
+
+    if sem_liga_ativa:
+      st.info(
+          "ℹ️ Nenhuma Liga de Clãs ativa foi encontrada para o Winning Wars. "
+          "Isso é normal fora do período da CWL. Quando houver uma Liga ativa, "
+          "as rodadas e os ataques aparecerão aqui automaticamente."
+      )
 
     if metas:
       st.markdown(f"##### 🏆 Guerras do Winning Wars encontradas: {len(metas)}")
@@ -4500,7 +4542,9 @@ def calcular_pontos_raide_v53(numero_ataques, bonus_top3=False):
   except Exception:
     ataques = 0
 
-  pontos_base = min(ataques * 2, 12)
+  # v53.2: cada ataque vale 1 ponto.
+  # O Top 3 em Capital Gold recebe +1 ponto adicional no fim de semana.
+  pontos_base = ataques
   bonus = 1 if bonus_top3 else 0
   return pontos_base, bonus, pontos_base + bonus
 
@@ -4618,7 +4662,7 @@ def renderizar_previa_raides_v53():
 
   st.markdown(
       "**Regra do Passe para Raides:** "
-      "`Pontos Base = min(Ataques × 2, 12)` e os **3 maiores Capital Gold** "
+      "`Pontos Base = número de ataques realizados` e os **3 maiores Capital Gold** "
       "do fim de semana recebem **+1 ponto** cada."
   )
 
