@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v55 HOMOLOGAÇÃO - Jogos do Clã otimizado: elegíveis, lote por PlayerTag, backup e anti-duplicidade.
+# Winning Wars v56 HOMOLOGAÇÃO - auditoria pública detalhada + ledger PontuacoesCompeticao.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -593,6 +593,18 @@ def conectar_banco():
             "Nome", "PontosJogos", "PontosPasse", "StatusJogos", "Aplicado"
         ])
 
+    try:
+        sheet_pontuacoes_competicao = spreadsheet.worksheet("PontuacoesCompeticao")
+    except gspread.WorksheetNotFound:
+        sheet_pontuacoes_competicao = spreadsheet.add_worksheet(
+            title="PontuacoesCompeticao", rows="10000", cols="13"
+        )
+        sheet_pontuacoes_competicao.append_row([
+            "DataHora", "PlayerTag", "Nome", "TipoAtividade", "EventoID",
+            "Descricao", "PontosBrutos", "PontosValidos", "ClanTagOrigem",
+            "RegraAplicada", "Fonte", "Aplicado", "Admin"
+        ])
+
     return (
         sheet_dados,
         sheet_admins,
@@ -607,6 +619,7 @@ def conectar_banco():
         sheet_backups,
         sheet_movimentacoes_supercell,
         sheet_jogos_cla_lancamentos,
+        sheet_pontuacoes_competicao,
     )
 
 
@@ -625,6 +638,7 @@ try:
         sheet_backups,
         sheet_movimentacoes_supercell,
         sheet_jogos_cla_lancamentos,
+        sheet_pontuacoes_competicao,
     ) = conectar_banco()
 
 except Exception as e:
@@ -3317,7 +3331,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v55)
+# SUPERCELL API - HOMOLOGAÇÃO (v56)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -4796,6 +4810,106 @@ def renderizar_previa_raides_v53():
 
 
 
+
+@st.cache_data(ttl=30, show_spinner=False)
+def obter_pontuacoes_competicao_v56():
+  try:
+    return sheet_pontuacoes_competicao.get_all_records()
+  except Exception:
+    return []
+
+
+def registrar_pontuacoes_competicao_v56(registros):
+  """Registra trilha pública de auditoria sem alterar o cálculo do ranking."""
+  if not registros:
+    return
+
+  linhas = []
+  for registro in registros:
+    linhas.append([
+        registro.get("DataHora", ""),
+        _supercell_normalizar_tag(registro.get("PlayerTag", "")),
+        registro.get("Nome", ""),
+        registro.get("TipoAtividade", ""),
+        registro.get("EventoID", ""),
+        registro.get("Descricao", ""),
+        registro.get("PontosBrutos", 0),
+        registro.get("PontosValidos", 0),
+        registro.get("ClanTagOrigem", ""),
+        registro.get("RegraAplicada", ""),
+        registro.get("Fonte", ""),
+        registro.get("Aplicado", "SIM"),
+        registro.get("Admin", st.session_state.get("admin_logado", "sistema")),
+    ])
+
+  sheet_pontuacoes_competicao.append_rows(
+      linhas,
+      value_input_option="USER_ENTERED",
+  )
+  obter_pontuacoes_competicao_v56.clear()
+
+
+def _resumo_publico_player_v56(row, colunas_guerras, colunas_liga, colunas_raides):
+  def soma_colunas(colunas):
+    total = 0
+    for coluna in colunas:
+      try:
+        total += int(float(row.get(coluna, 0) or 0))
+      except Exception:
+        pass
+    return total
+
+  try:
+    jogos = int(float(row.get("JogosCla", 0) or 0))
+  except Exception:
+    jogos = 0
+  try:
+    eventos = int(float(row.get("Eventos", 0) or 0))
+  except Exception:
+    eventos = 0
+  try:
+    total = int(float(row.get("Total", 0) or 0))
+  except Exception:
+    total = 0
+
+  return {
+      "Jogos": jogos,
+      "Guerras": soma_colunas(colunas_guerras),
+      "Liga": soma_colunas(colunas_liga),
+      "Raides": soma_colunas(colunas_raides),
+      "Eventos": eventos,
+      "Total": total,
+  }
+
+
+def _extrato_colunas_player_v56(row, colunas_guerras, colunas_liga, colunas_raides):
+  itens = []
+
+  definicoes = []
+  if "JogosCla" in row.index:
+    definicoes.append(("Jogos do Clã", "JogosCla"))
+  definicoes.extend(("Guerra", c) for c in colunas_guerras)
+  definicoes.extend(("Liga", c) for c in colunas_liga)
+  definicoes.extend(("Raide", c) for c in colunas_raides)
+  if "Eventos" in row.index:
+    definicoes.append(("Eventos", "Eventos"))
+
+  for tipo, coluna in definicoes:
+    try:
+      pontos = int(float(row.get(coluna, 0) or 0))
+    except Exception:
+      pontos = 0
+
+    itens.append({
+        "Tipo": tipo,
+        "Atividade": coluna,
+        "Pontos válidos": pontos,
+        "Origem": "Tabela competitiva atual",
+    })
+
+  return pd.DataFrame(itens)
+
+
 def calcular_pontos_jogos_cla_v55(pontos_jogos):
   try:
     pontos = max(0, int(float(pontos_jogos)))
@@ -5025,6 +5139,7 @@ def gravar_jogos_cla_v55(previa, meta):
       [
           ("DadosPlayers", sheet_dados),
           ("JogosClaLancamentos", sheet_jogos_cla_lancamentos),
+          ("PontuacoesCompeticao", sheet_pontuacoes_competicao),
       ],
   )
 
@@ -5097,6 +5212,36 @@ def gravar_jogos_cla_v55(previa, meta):
         historico_edicao,
         value_input_option="USER_ENTERED",
     )
+
+  # v56: trilha pública detalhada de auditoria.
+  registros_competicao = []
+  for _, row in previa.iterrows():
+    tag = _supercell_normalizar_tag(row.get("PlayerTag", ""))
+    if not tag or tag not in linha_por_tag:
+      continue
+
+    pontos_jogos = int(row.get("Pontos Jogos", 0) or 0)
+    pontos_passe = int(row.get("Pontos Passe", 0) or 0)
+    status_jogos = str(row.get("Status Jogos", "") or "").strip()
+    nome = str(row.get("Jogador", "") or nome_por_tag.get(tag, "")).strip()
+
+    registros_competicao.append({
+        "DataHora": agora,
+        "PlayerTag": tag,
+        "Nome": nome,
+        "TipoAtividade": "Jogos do Clã",
+        "EventoID": jogos_id,
+        "Descricao": edicao,
+        "PontosBrutos": pontos_jogos,
+        "PontosValidos": pontos_passe,
+        "ClanTagOrigem": "#YVLGUJQY",
+        "RegraAplicada": status_jogos,
+        "Fonte": "JogosClaLancamentos",
+        "Aplicado": "SIM",
+        "Admin": admin,
+    })
+
+  registrar_pontuacoes_competicao_v56(registros_competicao)
 
   if auditorias:
     sheet_auditoria.append_rows(
@@ -6531,6 +6676,132 @@ else:
 
       altura = min(900, max(300, 150 + len(df_tabela_mobile) * 40))
       components.html(html_tabela, height=altura, scrolling=False)
+
+      # ----------------------------------------------------------------
+      # v56 — EXTRATO PÚBLICO DE AUDITORIA
+      # ----------------------------------------------------------------
+      st.divider()
+      st.markdown("### 🔎 Extrato Público de Pontuação")
+      st.caption(
+          "Qualquer membro pode selecionar um jogador e conferir como o Total "
+          "da competição está distribuído entre Jogos, Guerras, Liga, Raides e Eventos. "
+          "Esta área é somente leitura."
+      )
+
+      opcoes_auditoria = df_competicao.sort_values(
+          "Nome",
+          key=lambda s: s.astype(str).str.casefold(),
+      ).copy()
+
+      if not opcoes_auditoria.empty:
+        labels = []
+        label_para_indice = {}
+
+        for idx_player, row_player in opcoes_auditoria.iterrows():
+          nome_player = str(row_player.get("Nome", "") or "").strip()
+          tag_player = _supercell_normalizar_tag(row_player.get("PlayerTag", ""))
+          label = f"{nome_player} — {tag_player}" if tag_player else nome_player
+          labels.append(label)
+          label_para_indice[label] = idx_player
+
+        selecionado = st.selectbox(
+            "👤 Selecione o jogador para auditar",
+            options=labels,
+            key="v56_player_auditoria_publica",
+        )
+
+        idx_selecionado = label_para_indice.get(selecionado)
+        row_player = opcoes_auditoria.loc[idx_selecionado]
+        player_tag = _supercell_normalizar_tag(row_player.get("PlayerTag", ""))
+        nome_player = str(row_player.get("Nome", "") or "").strip()
+
+        resumo_player = _resumo_publico_player_v56(
+            row_player,
+            colunas_guerras,
+            colunas_liga,
+            colunas_raides,
+        )
+
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        p1.metric("🎮 Jogos", resumo_player["Jogos"])
+        p2.metric("⚔️ Guerras", resumo_player["Guerras"])
+        p3.metric("🏆 Liga", resumo_player["Liga"])
+        p4.metric("⚡ Raides", resumo_player["Raides"])
+        p5.metric("🎉 Eventos", resumo_player["Eventos"])
+        p6.metric("📊 TOTAL", resumo_player["Total"])
+
+        st.markdown("##### 📋 Composição atualmente aplicada ao ranking")
+        extrato_colunas = _extrato_colunas_player_v56(
+            row_player,
+            colunas_guerras,
+            colunas_liga,
+            colunas_raides,
+        )
+        st.dataframe(
+            extrato_colunas,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("##### 🧾 Registros técnicos disponíveis")
+        registros_publicos = obter_pontuacoes_competicao_v56()
+        df_registros_publicos = pd.DataFrame(registros_publicos)
+
+        if (
+            not df_registros_publicos.empty
+            and "PlayerTag" in df_registros_publicos.columns
+            and player_tag
+        ):
+          tags_ledger = (
+              df_registros_publicos["PlayerTag"]
+              .astype(str)
+              .map(_supercell_normalizar_tag)
+          )
+          extrato_tecnico = df_registros_publicos[tags_ledger.eq(player_tag)].copy()
+
+          if not extrato_tecnico.empty:
+            colunas_publicas = [
+                c for c in [
+                    "DataHora",
+                    "TipoAtividade",
+                    "Descricao",
+                    "EventoID",
+                    "PontosBrutos",
+                    "PontosValidos",
+                    "RegraAplicada",
+                    "ClanTagOrigem",
+                    "Fonte",
+                ]
+                if c in extrato_tecnico.columns
+            ]
+
+            if "DataHora" in extrato_tecnico.columns:
+              extrato_tecnico = extrato_tecnico.sort_values(
+                  "DataHora",
+                  ascending=False,
+              )
+
+            st.dataframe(
+                extrato_tecnico[colunas_publicas],
+                use_container_width=True,
+                hide_index=True,
+            )
+          else:
+            st.info(
+                "Ainda não há registros técnicos detalhados para este jogador. "
+                "Os valores aplicados continuam visíveis na composição da tabela acima."
+            )
+        else:
+          st.info(
+              "A trilha técnica começará a ser preenchida pelos módulos novos. "
+              "A composição atual do ranking continua disponível acima."
+          )
+
+        st.caption(
+            "ℹ️ O Total oficial da v56 continua sendo a soma das colunas competitivas. "
+            "`PontuacoesCompeticao` funciona como trilha de auditoria e será alimentada "
+            "progressivamente por Jogos, Guerra, Liga, Raide e Eventos."
+        )
 
   # ABA 3: PERFIL INDIVIDUAL / CONQUISTAS
   with tab_perfil:
