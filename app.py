@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v56 HOMOLOGAÇÃO - auditoria pública detalhada + ledger PontuacoesCompeticao.
+# Winning Wars v58 HOMOLOGAÇÃO - plataforma de torneios 1x1 com inscrições, chaveamento e publicação controlada.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -605,6 +605,55 @@ def conectar_banco():
             "RegraAplicada", "Fonte", "Aplicado", "Admin"
         ])
 
+    try:
+        sheet_eventos_processados = spreadsheet.worksheet("EventosProcessados")
+    except gspread.WorksheetNotFound:
+        sheet_eventos_processados = spreadsheet.add_worksheet(
+            title="EventosProcessados", rows="5000", cols="14"
+        )
+        sheet_eventos_processados.append_row([
+            "EventoID", "TipoAtividade", "Descricao", "ClanTagOrigem",
+            "Status", "DataColeta", "DataValidacao", "DataAplicacao",
+            "RegistrosEsperados", "RegistrosAplicados", "HashDados",
+            "Admin", "Detalhe", "Bloqueado"
+        ])
+
+    try:
+        sheet_torneios = spreadsheet.worksheet("Torneios")
+    except gspread.WorksheetNotFound:
+        sheet_torneios = spreadsheet.add_worksheet(
+            title="Torneios", rows="1000", cols="14"
+        )
+        sheet_torneios.append_row([
+            "TorneioID", "Nome", "Descricao", "Status", "Visibilidade",
+            "CVsPermitidos", "Formato", "DataCriacao", "CriadoPor",
+            "CampeaoID", "CampeaoNome", "YoutubeURL", "Observacoes", "AtualizadoEm"
+        ])
+
+    try:
+        sheet_torneio_participantes = spreadsheet.worksheet("TorneioParticipantes")
+    except gspread.WorksheetNotFound:
+        sheet_torneio_participantes = spreadsheet.add_worksheet(
+            title="TorneioParticipantes", rows="5000", cols="9"
+        )
+        sheet_torneio_participantes.append_row([
+            "TorneioID", "ParticipanteID", "Nome", "PlayerTag",
+            "CentroVila", "Seed", "Status", "DataInscricao", "Observacao"
+        ])
+
+    try:
+        sheet_torneio_partidas = spreadsheet.worksheet("TorneioPartidas")
+    except gspread.WorksheetNotFound:
+        sheet_torneio_partidas = spreadsheet.add_worksheet(
+            title="TorneioPartidas", rows="10000", cols="15"
+        )
+        sheet_torneio_partidas.append_row([
+            "TorneioID", "PartidaID", "Rodada", "Fase", "Ordem",
+            "P1ID", "P1Nome", "P2ID", "P2Nome",
+            "VencedorID", "VencedorNome", "Status",
+            "DataAtualizacao", "Observacao", "Origem"
+        ])
+
     return (
         sheet_dados,
         sheet_admins,
@@ -620,6 +669,10 @@ def conectar_banco():
         sheet_movimentacoes_supercell,
         sheet_jogos_cla_lancamentos,
         sheet_pontuacoes_competicao,
+        sheet_eventos_processados,
+        sheet_torneios,
+        sheet_torneio_participantes,
+        sheet_torneio_partidas,
     )
 
 
@@ -639,6 +692,10 @@ try:
         sheet_movimentacoes_supercell,
         sheet_jogos_cla_lancamentos,
         sheet_pontuacoes_competicao,
+        sheet_eventos_processados,
+        sheet_torneios,
+        sheet_torneio_participantes,
+        sheet_torneio_partidas,
     ) = conectar_banco()
 
 except Exception as e:
@@ -3331,7 +3388,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v56)
+# SUPERCELL API - HOMOLOGAÇÃO (v58)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -4811,6 +4868,204 @@ def renderizar_previa_raides_v53():
 
 
 
+
+@st.cache_data(ttl=20, show_spinner=False)
+def obter_eventos_processados_v57():
+  try:
+    return sheet_eventos_processados.get_all_records()
+  except Exception:
+    return []
+
+
+def _hash_evento_v57(objeto) -> str:
+  try:
+    if isinstance(objeto, pd.DataFrame):
+      payload = objeto.sort_index(axis=1).to_json(
+          orient="records",
+          force_ascii=False,
+          date_format="iso",
+      )
+    else:
+      payload = json.dumps(
+          objeto,
+          ensure_ascii=False,
+          sort_keys=True,
+          default=str,
+      )
+  except Exception:
+    payload = str(objeto)
+
+  return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def evento_processado_v57(evento_id: str):
+  evento_id = str(evento_id or "").strip()
+  if not evento_id:
+    return None
+
+  for registro in obter_eventos_processados_v57():
+    if str(registro.get("EventoID", "") or "").strip() == evento_id:
+      return registro
+  return None
+
+
+def evento_bloqueado_v57(evento_id: str) -> bool:
+  registro = evento_processado_v57(evento_id)
+  if not registro:
+    return False
+
+  bloqueado = str(registro.get("Bloqueado", "") or "").strip().upper()
+  status = str(registro.get("Status", "") or "").strip().upper()
+  return bloqueado == "SIM" or status in {"APLICADO", "BLOQUEADO"}
+
+
+def registrar_evento_processado_v57(
+    evento_id,
+    tipo_atividade,
+    descricao,
+    clan_tag_origem,
+    status,
+    registros_esperados=0,
+    registros_aplicados=0,
+    hash_dados="",
+    detalhe="",
+    bloquear=False,
+):
+  evento_id = str(evento_id or "").strip()
+  if not evento_id:
+    raise RuntimeError("EventoID obrigatório para controle de idempotência.")
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  admin = st.session_state.get("admin_logado", "sistema")
+
+  existente = evento_processado_v57(evento_id)
+  if existente and evento_bloqueado_v57(evento_id):
+    raise RuntimeError(
+        f"O evento {evento_id} já está aplicado/bloqueado e não pode ser processado novamente."
+    )
+
+  data_coleta = agora if status in {"COLETADO", "VALIDADO", "APLICADO"} else ""
+  data_validacao = agora if status in {"VALIDADO", "APLICADO"} else ""
+  data_aplicacao = agora if status == "APLICADO" else ""
+
+  linha = [[
+      evento_id,
+      tipo_atividade,
+      descricao,
+      _supercell_normalizar_tag(clan_tag_origem),
+      status,
+      data_coleta,
+      data_validacao,
+      data_aplicacao,
+      int(registros_esperados or 0),
+      int(registros_aplicados or 0),
+      hash_dados,
+      admin,
+      detalhe,
+      "SIM" if bloquear else "NAO",
+  ]]
+
+  if existente:
+    valores = sheet_eventos_processados.get_all_values()
+    headers = valores[0] if valores else []
+    if "EventoID" not in headers:
+      raise RuntimeError("Cabeçalho EventoID ausente em EventosProcessados.")
+
+    idx_id = headers.index("EventoID")
+    linha_num = None
+    for i, row in enumerate(valores[1:], start=2):
+      if idx_id < len(row) and str(row[idx_id]).strip() == evento_id:
+        linha_num = i
+        break
+
+    if linha_num:
+      ultima_col = gspread.utils.rowcol_to_a1(1, len(linha[0])).replace("1", "")
+      sheet_eventos_processados.update(
+          range_name=f"A{linha_num}:{ultima_col}{linha_num}",
+          values=linha,
+          value_input_option="USER_ENTERED",
+      )
+  else:
+    sheet_eventos_processados.append_rows(
+        linha,
+        value_input_option="USER_ENTERED",
+    )
+
+  obter_eventos_processados_v57.clear()
+
+
+def validar_evento_antes_aplicar_v57(
+    evento_id,
+    tipo_atividade,
+    descricao,
+    clan_tag_origem,
+    dados,
+    registros_esperados,
+):
+  if evento_bloqueado_v57(evento_id):
+    raise RuntimeError(
+        f"🔒 O evento {evento_id} já foi aplicado anteriormente. "
+        "A duplicidade foi bloqueada."
+    )
+
+  principal = _supercell_normalizar_tag(st.secrets.get("supercell_clan_tag", ""))
+  origem = _supercell_normalizar_tag(clan_tag_origem)
+
+  if origem != principal:
+    raise RuntimeError(
+        f"Evento rejeitado: origem {origem} não corresponde ao clã principal {principal}."
+    )
+
+  if registros_esperados is None or int(registros_esperados) < 0:
+    raise RuntimeError("Quantidade de registros esperados inválida.")
+
+  hash_dados = _hash_evento_v57(dados)
+
+  registrar_evento_processado_v57(
+      evento_id=evento_id,
+      tipo_atividade=tipo_atividade,
+      descricao=descricao,
+      clan_tag_origem=origem,
+      status="VALIDADO",
+      registros_esperados=int(registros_esperados),
+      registros_aplicados=0,
+      hash_dados=hash_dados,
+      detalhe="Evento validado e pronto para aplicação.",
+      bloquear=False,
+  )
+  return hash_dados
+
+
+def marcar_evento_aplicado_v57(
+    evento_id,
+    tipo_atividade,
+    descricao,
+    clan_tag_origem,
+    hash_dados,
+    registros_esperados,
+    registros_aplicados,
+    detalhe="",
+):
+  if int(registros_aplicados) != int(registros_esperados):
+    raise RuntimeError(
+        f"Aplicação incompleta: esperados {registros_esperados}, "
+        f"aplicados {registros_aplicados}. Evento não será bloqueado como concluído."
+    )
+
+  registrar_evento_processado_v57(
+      evento_id=evento_id,
+      tipo_atividade=tipo_atividade,
+      descricao=descricao,
+      clan_tag_origem=clan_tag_origem,
+      status="APLICADO",
+      registros_esperados=registros_esperados,
+      registros_aplicados=registros_aplicados,
+      hash_dados=hash_dados,
+      detalhe=detalhe or "Evento aplicado integralmente.",
+      bloquear=True,
+  )
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def obter_pontuacoes_competicao_v56():
   try:
@@ -5133,6 +5388,16 @@ def gravar_jogos_cla_v55(previa, meta):
     if idx_nome is not None:
       nome_por_tag[tag] = str(linha[idx_nome] if idx_nome < len(linha) else "").strip()
 
+  # v57: validação/idempotência central antes de qualquer escrita.
+  hash_evento = validar_evento_antes_aplicar_v57(
+      evento_id=f"JOGOS:{jogos_id}",
+      tipo_atividade="Jogos do Clã",
+      descricao=edicao,
+      clan_tag_origem="#YVLGUJQY",
+      dados=previa,
+      registros_esperados=len(previa),
+  )
+
   # Backup obrigatório antes de qualquer escrita.
   exigir_backup_automatico(
       f"Jogos do Clã {jogos_id} - lançamento definitivo",
@@ -5140,6 +5405,7 @@ def gravar_jogos_cla_v55(previa, meta):
           ("DadosPlayers", sheet_dados),
           ("JogosClaLancamentos", sheet_jogos_cla_lancamentos),
           ("PontuacoesCompeticao", sheet_pontuacoes_competicao),
+          ("EventosProcessados", sheet_eventos_processados),
       ],
   )
 
@@ -5272,6 +5538,18 @@ def gravar_jogos_cla_v55(previa, meta):
     pass
 
   snapshot_ranking_atual("alteracao", f"Lançamento Jogos do Clã {jogos_id}")
+
+  # v57: só bloqueia o EventoID depois da aplicação integral.
+  marcar_evento_aplicado_v57(
+      evento_id=f"JOGOS:{jogos_id}",
+      tipo_atividade="Jogos do Clã",
+      descricao=edicao,
+      clan_tag_origem="#YVLGUJQY",
+      hash_dados=hash_evento,
+      registros_esperados=len(previa),
+      registros_aplicados=len(atualizacoes),
+      detalhe=f"Jogos aplicados em lote para {len(atualizacoes)} jogadores.",
+  )
 
   return {
       "aplicados": len(atualizacoes),
@@ -5513,6 +5791,49 @@ def renderizar_jogos_cla_v55():
       st.info("Nenhuma edição dos Jogos do Clã foi lançada ainda.")
 
 
+
+def renderizar_monitor_eventos_v57():
+  st.markdown("#### 🛡️ Segurança e Idempotência")
+  st.caption(
+      "Controle central de eventos processados. Um EventoID aplicado fica bloqueado "
+      "contra nova gravação, mesmo se o botão for acionado novamente."
+  )
+
+  registros = obter_eventos_processados_v57()
+  if not registros:
+    st.info("Ainda não existem eventos registrados no controle de idempotência.")
+    return
+
+  df_evt = pd.DataFrame(registros)
+
+  e1, e2, e3, e4 = st.columns(4)
+  if "Status" in df_evt.columns:
+    status_upper = df_evt["Status"].astype(str).str.upper()
+    e1.metric("Coletados", int(status_upper.eq("COLETADO").sum()))
+    e2.metric("Validados", int(status_upper.eq("VALIDADO").sum()))
+    e3.metric("Aplicados", int(status_upper.eq("APLICADO").sum()))
+  if "Bloqueado" in df_evt.columns:
+    e4.metric(
+        "🔒 Bloqueados",
+        int(df_evt["Bloqueado"].astype(str).str.upper().eq("SIM").sum()),
+    )
+
+  colunas = [
+      c for c in [
+          "EventoID", "TipoAtividade", "Descricao", "ClanTagOrigem",
+          "Status", "DataValidacao", "DataAplicacao",
+          "RegistrosEsperados", "RegistrosAplicados",
+          "Bloqueado", "Detalhe"
+      ]
+      if c in df_evt.columns
+  ]
+  st.dataframe(
+      df_evt[colunas].tail(200).iloc[::-1],
+      use_container_width=True,
+      hide_index=True,
+  )
+
+
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
@@ -5707,6 +6028,9 @@ def renderizar_integracao_supercell():
   renderizar_jogos_cla_v55()
 
   st.divider()
+  renderizar_monitor_eventos_v57()
+
+  st.divider()
   st.markdown("#### 📜 Histórico de movimentações")
   try:
     historico_mov = sheet_movimentacoes_supercell.get_all_records()
@@ -5727,6 +6051,1005 @@ def renderizar_integracao_supercell():
       "🔒 Toda identificação usa PlayerTag. Mudanças de nome ou caracteres especiais "
       "não criam um novo jogador. A sincronização desta versão não altera pontuações."
   )
+
+
+
+# =============================================================================
+# TORNEIOS 1x1 — v58
+# =============================================================================
+
+@st.cache_data(ttl=20, show_spinner=False)
+def obter_torneios_v58():
+  try:
+    return sheet_torneios.get_all_records()
+  except Exception:
+    return []
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def obter_torneio_participantes_v58():
+  try:
+    return sheet_torneio_participantes.get_all_records()
+  except Exception:
+    return []
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def obter_torneio_partidas_v58():
+  try:
+    return sheet_torneio_partidas.get_all_records()
+  except Exception:
+    return []
+
+
+def _torneio_limpar_cache_v58():
+  obter_torneios_v58.clear()
+  obter_torneio_participantes_v58.clear()
+  obter_torneio_partidas_v58.clear()
+
+
+def _torneio_id_v58(nome):
+  base = re.sub(r"[^A-Z0-9]+", "-", str(nome or "").upper()).strip("-")[:20] or "TORNEIO"
+  return f"TRN-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{base}"
+
+
+def _participante_id_v58(torneio_id, sequencia):
+  return f"{torneio_id}-P{int(sequencia):03d}"
+
+
+def _partida_id_v58(torneio_id, rodada, ordem):
+  return f"{torneio_id}-R{int(rodada):02d}-M{int(ordem):02d}"
+
+
+def _fase_por_qtd_partidas_v58(qtd_partidas):
+  qtd = int(qtd_partidas or 0)
+  mapa = {
+      1: "🏆 Final",
+      2: "🔥 Semifinal",
+      4: "⚔️ Quartas de final",
+      8: "🛡️ Oitavas de final",
+      16: "⚡ 16 avos",
+      32: "💥 32 avos",
+  }
+  return mapa.get(qtd, f"Rodada com {qtd} partidas")
+
+
+def _proxima_potencia_2_v58(n):
+  n = max(2, int(n))
+  potencia = 1
+  while potencia < n:
+    potencia *= 2
+  return potencia
+
+
+def _torneio_por_id_v58(torneio_id):
+  for t in obter_torneios_v58():
+    if str(t.get("TorneioID", "")).strip() == str(torneio_id).strip():
+      return t
+  return None
+
+
+def _participantes_do_torneio_v58(torneio_id):
+  registros = [
+      p for p in obter_torneio_participantes_v58()
+      if str(p.get("TorneioID", "")).strip() == str(torneio_id).strip()
+  ]
+  return registros
+
+
+def _partidas_do_torneio_v58(torneio_id):
+  partidas = [
+      p for p in obter_torneio_partidas_v58()
+      if str(p.get("TorneioID", "")).strip() == str(torneio_id).strip()
+  ]
+  try:
+    partidas.sort(key=lambda x: (int(x.get("Rodada", 0)), int(x.get("Ordem", 0))))
+  except Exception:
+    pass
+  return partidas
+
+
+def _atualizar_linha_por_id_v58(sheet, coluna_id, valor_id, novos_valores):
+  valores = sheet.get_all_values()
+  if not valores:
+    raise RuntimeError("Planilha sem cabeçalho.")
+
+  headers = valores[0]
+  if coluna_id not in headers:
+    raise RuntimeError(f"Coluna {coluna_id} não encontrada.")
+
+  idx_id = headers.index(coluna_id)
+  linha_num = None
+
+  for i, linha in enumerate(valores[1:], start=2):
+    if idx_id < len(linha) and str(linha[idx_id]).strip() == str(valor_id).strip():
+      linha_num = i
+      break
+
+  if not linha_num:
+    raise RuntimeError(f"Registro {valor_id} não encontrado.")
+
+  updates = []
+  for coluna, valor in novos_valores.items():
+    if coluna not in headers:
+      continue
+    col_num = headers.index(coluna) + 1
+    updates.append({
+        "range": gspread.utils.rowcol_to_a1(linha_num, col_num),
+        "values": [[valor]],
+    })
+
+  if updates:
+    sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
+def criar_torneio_v58(nome, descricao, cvs, youtube_url="", observacoes=""):
+  nome = str(nome or "").strip()
+  if not nome:
+    raise RuntimeError("Informe um nome para o torneio.")
+  if not cvs:
+    raise RuntimeError("Selecione ao menos um Centro de Vila.")
+
+  torneio_id = _torneio_id_v58(nome)
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  admin = st.session_state.get("admin_logado", "sistema")
+
+  sheet_torneios.append_row([
+      torneio_id,
+      nome,
+      str(descricao or "").strip(),
+      "INSCRICOES",
+      "OCULTO",
+      ",".join(str(cv) for cv in cvs),
+      "1x1 Eliminatório",
+      agora,
+      admin,
+      "",
+      "",
+      str(youtube_url or "").strip(),
+      str(observacoes or "").strip(),
+      agora,
+  ])
+
+  registrar_log(admin, f"Criou torneio '{nome}' ({torneio_id})")
+  _torneio_limpar_cache_v58()
+  return torneio_id
+
+
+def adicionar_participante_v58(torneio_id, nome, player_tag, cv, seed="", observacao=""):
+  torneio = _torneio_por_id_v58(torneio_id)
+  if not torneio:
+    raise RuntimeError("Torneio não encontrado.")
+
+  if str(torneio.get("Status", "")).upper() not in {"INSCRICOES", "RASCUNHO"}:
+    raise RuntimeError("As inscrições deste torneio já foram encerradas.")
+
+  nome = str(nome or "").strip()
+  if not nome:
+    raise RuntimeError("Informe o nome do participante.")
+
+  participantes = _participantes_do_torneio_v58(torneio_id)
+  seq = len(participantes) + 1
+  participante_id = _participante_id_v58(torneio_id, seq)
+
+  tag = _supercell_normalizar_tag(player_tag) if str(player_tag or "").strip() else ""
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  sheet_torneio_participantes.append_row([
+      torneio_id,
+      participante_id,
+      nome,
+      tag,
+      int(cv),
+      str(seed or "").strip(),
+      "INSCRITO",
+      agora,
+      str(observacao or "").strip(),
+  ])
+
+  _torneio_limpar_cache_v58()
+  return participante_id
+
+
+def remover_participante_v58(participante_id):
+  valores = sheet_torneio_participantes.get_all_values()
+  if not valores:
+    return
+  headers = valores[0]
+  if "ParticipanteID" not in headers:
+    return
+  idx = headers.index("ParticipanteID")
+
+  linha_num = None
+  for i, linha in enumerate(valores[1:], start=2):
+    if idx < len(linha) and str(linha[idx]).strip() == str(participante_id).strip():
+      linha_num = i
+      break
+
+  if linha_num:
+    sheet_torneio_participantes.delete_rows(linha_num)
+    _torneio_limpar_cache_v58()
+
+
+def definir_visibilidade_torneio_v58(torneio_id, publico):
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      torneio_id,
+      {
+          "Visibilidade": "PUBLICO" if publico else "OCULTO",
+          "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      },
+  )
+  _torneio_limpar_cache_v58()
+
+
+def atualizar_dados_torneio_v58(torneio_id, youtube_url=None, observacoes=None):
+  payload = {"AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+  if youtube_url is not None:
+    payload["YoutubeURL"] = str(youtube_url).strip()
+  if observacoes is not None:
+    payload["Observacoes"] = str(observacoes).strip()
+  _atualizar_linha_por_id_v58(sheet_torneios, "TorneioID", torneio_id, payload)
+  _torneio_limpar_cache_v58()
+
+
+def gerar_chaveamento_v58(torneio_id):
+  torneio = _torneio_por_id_v58(torneio_id)
+  if not torneio:
+    raise RuntimeError("Torneio não encontrado.")
+
+  if _partidas_do_torneio_v58(torneio_id):
+    raise RuntimeError("Este torneio já possui chaveamento gerado.")
+
+  participantes = _participantes_do_torneio_v58(torneio_id)
+  participantes = [p for p in participantes if str(p.get("Status", "")).upper() == "INSCRITO"]
+
+  if len(participantes) < 2:
+    raise RuntimeError("São necessários pelo menos 2 participantes.")
+
+  # Seeds numéricos válidos ficam na frente; demais são embaralhados.
+  com_seed = []
+  sem_seed = []
+  for p in participantes:
+    try:
+      seed = int(str(p.get("Seed", "")).strip())
+      if seed > 0:
+        com_seed.append((seed, p))
+      else:
+        sem_seed.append(p)
+    except Exception:
+      sem_seed.append(p)
+
+  com_seed.sort(key=lambda x: x[0])
+  random.shuffle(sem_seed)
+  ordenados = [p for _, p in com_seed] + sem_seed
+
+  tamanho_chave = _proxima_potencia_2_v58(len(ordenados))
+  byes = tamanho_chave - len(ordenados)
+
+  # Distribui byes nas extremidades para evitar concentrá-los.
+  slots = list(ordenados)
+  for _ in range(byes):
+    slots.append(None)
+
+  # Embaralha só a posição dos não-seeds quando não há seeds suficientes.
+  # O objetivo é um chaveamento simples e transparente para torneios internos.
+  qtd_partidas = tamanho_chave // 2
+  fase = _fase_por_qtd_partidas_v58(qtd_partidas)
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  linhas = []
+  for i in range(qtd_partidas):
+    p1 = slots[i * 2] if i * 2 < len(slots) else None
+    p2 = slots[i * 2 + 1] if i * 2 + 1 < len(slots) else None
+
+    p1_id = str(p1.get("ParticipanteID", "")) if p1 else ""
+    p1_nome = str(p1.get("Nome", "")) if p1 else "BYE"
+    p2_id = str(p2.get("ParticipanteID", "")) if p2 else ""
+    p2_nome = str(p2.get("Nome", "")) if p2 else "BYE"
+
+    vencedor_id = ""
+    vencedor_nome = ""
+    status = "AGUARDANDO"
+
+    if p1 and not p2:
+      vencedor_id, vencedor_nome, status = p1_id, p1_nome, "BYE"
+    elif p2 and not p1:
+      vencedor_id, vencedor_nome, status = p2_id, p2_nome, "BYE"
+
+    linhas.append([
+        torneio_id,
+        _partida_id_v58(torneio_id, 1, i + 1),
+        1,
+        fase,
+        i + 1,
+        p1_id,
+        p1_nome,
+        p2_id,
+        p2_nome,
+        vencedor_id,
+        vencedor_nome,
+        status,
+        agora,
+        "Avanço automático por BYE" if status == "BYE" else "",
+        "GERADO",
+    ])
+
+  sheet_torneio_partidas.append_rows(linhas, value_input_option="USER_ENTERED")
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneios,
+      "TorneioID",
+      torneio_id,
+      {
+          "Status": "EM_ANDAMENTO",
+          "AtualizadoEm": agora,
+      },
+  )
+
+  _torneio_limpar_cache_v58()
+  _criar_proxima_rodada_se_pronta_v58(torneio_id)
+
+
+def _criar_proxima_rodada_se_pronta_v58(torneio_id):
+  partidas = _partidas_do_torneio_v58(torneio_id)
+  if not partidas:
+    return
+
+  rodada_atual = max(int(p.get("Rodada", 0) or 0) for p in partidas)
+  atuais = [p for p in partidas if int(p.get("Rodada", 0) or 0) == rodada_atual]
+
+  if not atuais:
+    return
+
+  # Só avança quando todas as partidas têm vencedor.
+  if any(not str(p.get("VencedorID", "") or "").strip() for p in atuais):
+    return
+
+  # Se era a Final, encerra o torneio.
+  if len(atuais) == 1:
+    final = atuais[0]
+    campeao_id = str(final.get("VencedorID", "")).strip()
+    campeao_nome = str(final.get("VencedorNome", "")).strip()
+
+    _atualizar_linha_por_id_v58(
+        sheet_torneios,
+        "TorneioID",
+        torneio_id,
+        {
+            "Status": "FINALIZADO",
+            "CampeaoID": campeao_id,
+            "CampeaoNome": campeao_nome,
+            "AtualizadoEm": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
+
+    if campeao_id:
+      _atualizar_linha_por_id_v58(
+          sheet_torneio_participantes,
+          "ParticipanteID",
+          campeao_id,
+          {"Status": "CAMPEAO"},
+      )
+
+    _torneio_limpar_cache_v58()
+    return
+
+  # Evita criar a próxima rodada duas vezes.
+  proxima = rodada_atual + 1
+  if any(int(p.get("Rodada", 0) or 0) == proxima for p in partidas):
+    return
+
+  vencedores = [
+      {
+          "id": str(p.get("VencedorID", "")).strip(),
+          "nome": str(p.get("VencedorNome", "")).strip(),
+      }
+      for p in sorted(atuais, key=lambda x: int(x.get("Ordem", 0) or 0))
+  ]
+
+  qtd_partidas = len(vencedores) // 2
+  fase = _fase_por_qtd_partidas_v58(qtd_partidas)
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  linhas = []
+  for i in range(qtd_partidas):
+    p1 = vencedores[i * 2]
+    p2 = vencedores[i * 2 + 1]
+
+    linhas.append([
+        torneio_id,
+        _partida_id_v58(torneio_id, proxima, i + 1),
+        proxima,
+        fase,
+        i + 1,
+        p1["id"],
+        p1["nome"],
+        p2["id"],
+        p2["nome"],
+        "",
+        "",
+        "AGUARDANDO",
+        agora,
+        "",
+        "AVANCO",
+    ])
+
+  if linhas:
+    sheet_torneio_partidas.append_rows(linhas, value_input_option="USER_ENTERED")
+    _torneio_limpar_cache_v58()
+
+
+def definir_vencedor_partida_v58(partida_id, vencedor_id):
+  partidas = obter_torneio_partidas_v58()
+  partida = next(
+      (p for p in partidas if str(p.get("PartidaID", "")).strip() == str(partida_id).strip()),
+      None,
+  )
+  if not partida:
+    raise RuntimeError("Partida não encontrada.")
+
+  if str(partida.get("VencedorID", "") or "").strip():
+    raise RuntimeError("Esta partida já possui vencedor definido.")
+
+  ids_validos = {
+      str(partida.get("P1ID", "") or "").strip(): str(partida.get("P1Nome", "") or "").strip(),
+      str(partida.get("P2ID", "") or "").strip(): str(partida.get("P2Nome", "") or "").strip(),
+  }
+  ids_validos = {k: v for k, v in ids_validos.items() if k}
+
+  if vencedor_id not in ids_validos:
+    raise RuntimeError("O vencedor precisa ser um dos participantes da partida.")
+
+  vencedor_nome = ids_validos[vencedor_id]
+  perdedor_id = next((pid for pid in ids_validos if pid != vencedor_id), "")
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  _atualizar_linha_por_id_v58(
+      sheet_torneio_partidas,
+      "PartidaID",
+      partida_id,
+      {
+          "VencedorID": vencedor_id,
+          "VencedorNome": vencedor_nome,
+          "Status": "FINALIZADA",
+          "DataAtualizacao": agora,
+      },
+  )
+
+  if perdedor_id:
+    _atualizar_linha_por_id_v58(
+        sheet_torneio_participantes,
+        "ParticipanteID",
+        perdedor_id,
+        {"Status": "ELIMINADO"},
+    )
+
+  _torneio_limpar_cache_v58()
+  _criar_proxima_rodada_se_pronta_v58(str(partida.get("TorneioID", "")))
+
+
+def _torneios_publicos_v58():
+  return [
+      t for t in obter_torneios_v58()
+      if str(t.get("Visibilidade", "")).upper() == "PUBLICO"
+  ]
+
+
+def torneios_visiveis_para_usuario_v58():
+  if "admin_logado" in st.session_state:
+    return True
+  return bool(_torneios_publicos_v58())
+
+
+def _css_torneios_v58():
+  st.markdown(
+      """
+      <style>
+      .ww-tournament-hero{
+        position:relative; overflow:hidden; border-radius:24px; padding:24px;
+        border:1px solid rgba(250,204,21,.30);
+        background:
+          radial-gradient(circle at 85% 20%, rgba(250,204,21,.16), transparent 26%),
+          radial-gradient(circle at 15% 80%, rgba(59,130,246,.16), transparent 28%),
+          linear-gradient(135deg,#07111f 0%,#111827 52%,#1b2433 100%);
+        box-shadow:0 18px 45px rgba(0,0,0,.28);
+        margin-bottom:18px;
+      }
+      .ww-tournament-hero:after{
+        content:"⚔️"; position:absolute; right:24px; top:10px; font-size:92px;
+        opacity:.08; transform:rotate(-12deg);
+      }
+      .ww-t-title{font-weight:950;font-size:2rem;color:#facc15;letter-spacing:.5px}
+      .ww-t-sub{color:#cbd5e1;margin-top:4px;max-width:760px}
+      .ww-match{
+        border:1px solid #334155; border-radius:16px; padding:14px 16px;
+        background:linear-gradient(180deg,#111827,#0b1220);
+        margin:8px 0; box-shadow:0 8px 24px rgba(0,0,0,.18);
+      }
+      .ww-match-title{font-size:.78rem;color:#facc15;font-weight:900;letter-spacing:.8px}
+      .ww-player{font-weight:850;color:#f8fafc;padding:5px 0}
+      .ww-vs{color:#64748b;font-size:.78rem;font-weight:800}
+      .ww-winner{color:#86efac;font-weight:950}
+      .ww-champion{
+        border:1px solid rgba(250,204,21,.55); border-radius:22px; padding:22px;
+        text-align:center; background:linear-gradient(135deg,#422006,#111827 70%);
+        box-shadow:0 0 34px rgba(250,204,21,.14);
+      }
+      </style>
+      """,
+      unsafe_allow_html=True,
+  )
+
+
+def _renderizar_chaveamento_visual_v58(torneio_id):
+  partidas = _partidas_do_torneio_v58(torneio_id)
+  torneio = _torneio_por_id_v58(torneio_id)
+
+  if not partidas:
+    st.info("O chaveamento ainda não foi gerado.")
+    return
+
+  rodadas = sorted(set(int(p.get("Rodada", 0) or 0) for p in partidas))
+  for rodada in rodadas:
+    partidas_rodada = [p for p in partidas if int(p.get("Rodada", 0) or 0) == rodada]
+    if not partidas_rodada:
+      continue
+
+    fase = str(partidas_rodada[0].get("Fase", f"Rodada {rodada}"))
+    st.markdown(f"### {fase}")
+
+    colunas = st.columns(min(2, max(1, len(partidas_rodada))))
+    for idx, p in enumerate(partidas_rodada):
+      with colunas[idx % len(colunas)]:
+        p1 = str(p.get("P1Nome", "BYE") or "BYE")
+        p2 = str(p.get("P2Nome", "BYE") or "BYE")
+        vencedor = str(p.get("VencedorNome", "") or "").strip()
+        status = str(p.get("Status", "") or "")
+
+        vencedor_html = (
+            f'<div class="ww-winner">🏅 Vencedor: {vencedor}</div>'
+            if vencedor else
+            f'<div style="color:#94a3b8">Status: {status}</div>'
+        )
+
+        st.markdown(
+            f"""
+            <div class="ww-match">
+              <div class="ww-match-title">PARTIDA {p.get("Ordem","")}</div>
+              <div class="ww-player">🛡️ {p1}</div>
+              <div class="ww-vs">VS</div>
+              <div class="ww-player">⚔️ {p2}</div>
+              {vencedor_html}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+  if torneio and str(torneio.get("Status", "")).upper() == "FINALIZADO":
+    campeao = str(torneio.get("CampeaoNome", "") or "").strip()
+    if campeao:
+      st.markdown(
+          f"""
+          <div class="ww-champion">
+            <div style="font-size:2.6rem">🏆</div>
+            <div style="color:#facc15;font-weight:950;font-size:1.4rem">CAMPEÃO</div>
+            <div style="font-size:2rem;font-weight:950;color:white">{campeao}</div>
+          </div>
+          """,
+          unsafe_allow_html=True,
+      )
+
+
+def renderizar_torneios_v58():
+  _css_torneios_v58()
+  admin = "admin_logado" in st.session_state
+
+  st.markdown(
+      """
+      <div class="ww-tournament-hero">
+        <div class="ww-t-title">⚔️ Winning Wars — Arena de Torneios</div>
+        <div class="ww-t-sub">
+          Chaveamentos 1x1, eliminações por fase, classificação ao vivo e estrutura
+          preparada para torneios internos ou eventos transmitidos.
+        </div>
+      </div>
+      """,
+      unsafe_allow_html=True,
+  )
+
+  torneios = obter_torneios_v58()
+  if not admin:
+    torneios = [
+        t for t in torneios
+        if str(t.get("Visibilidade", "")).upper() == "PUBLICO"
+    ]
+
+  if not torneios and not admin:
+    st.info("Nenhum torneio está liberado para visualização no momento.")
+    return
+
+  if admin:
+    tab_lista, tab_novo, tab_inscricoes, tab_chave, tab_publicacao = st.tabs([
+        "🏟️ Torneios",
+        "✨ Novo Torneio",
+        "📝 Inscrições",
+        "⚔️ Chaveamento",
+        "📡 Publicação",
+    ])
+
+    with tab_novo:
+      st.markdown("### ✨ Criar novo torneio")
+      with st.form("v58_form_novo_torneio", clear_on_submit=True):
+        nome = st.text_input("Nome do torneio", placeholder="Ex.: Copa Winning Wars — Agosto")
+        descricao = st.text_area(
+            "Descrição",
+            placeholder="Regras gerais, formato, premiação ou contexto do evento.",
+        )
+
+        cvs = st.multiselect(
+            "Centros de Vila permitidos",
+            options=list(range(8, 19)),
+            default=[16, 17],
+            format_func=lambda x: f"CV {x}",
+        )
+
+        youtube = st.text_input(
+            "Link da transmissão / YouTube (opcional)",
+            placeholder="Cole o link quando houver transmissão.",
+        )
+        obs = st.text_area("Observações internas (opcional)")
+
+        criar = st.form_submit_button("🏆 Criar torneio", use_container_width=True)
+        if criar:
+          try:
+            tid = criar_torneio_v58(nome, descricao, cvs, youtube, obs)
+            st.success(f"✅ Torneio criado: `{tid}`")
+            st.rerun()
+          except Exception as exc:
+            st.error(str(exc))
+
+    with tab_lista:
+      torneios_admin = obter_torneios_v58()
+      if not torneios_admin:
+        st.info("Nenhum torneio criado ainda.")
+      else:
+        df_t = pd.DataFrame(torneios_admin)
+        colunas = [
+            c for c in [
+                "Nome", "Status", "Visibilidade", "CVsPermitidos",
+                "CampeaoNome", "YoutubeURL", "AtualizadoEm"
+            ]
+            if c in df_t.columns
+        ]
+        st.dataframe(df_t[colunas], use_container_width=True, hide_index=True)
+
+        nomes = {
+            f"{t.get('Nome','Torneio')} — {t.get('Status','')}": t.get("TorneioID")
+            for t in torneios_admin
+        }
+        escolha = st.selectbox(
+            "Abrir torneio",
+            options=list(nomes.keys()),
+            key="v58_torneio_lista",
+        )
+        tid = nomes[escolha]
+        torneio = _torneio_por_id_v58(tid)
+        participantes = _participantes_do_torneio_v58(tid)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Inscritos", len(participantes))
+        c2.metric("Status", torneio.get("Status", "-"))
+        c3.metric("Visibilidade", torneio.get("Visibilidade", "-"))
+
+        st.markdown(f"**CVs:** {torneio.get('CVsPermitidos','-')}")
+        if str(torneio.get("Descricao", "")).strip():
+          st.write(torneio.get("Descricao"))
+
+        if str(torneio.get("YoutubeURL", "")).strip():
+          st.markdown(f"📺 **Transmissão:** {torneio.get('YoutubeURL')}")
+
+        _renderizar_chaveamento_visual_v58(tid)
+
+    with tab_inscricoes:
+      torneios_abertos = [
+          t for t in obter_torneios_v58()
+          if str(t.get("Status", "")).upper() in {"INSCRICOES", "RASCUNHO"}
+      ]
+
+      if not torneios_abertos:
+        st.info("Não há torneios com inscrições abertas.")
+      else:
+        mapa = {t.get("Nome", "Torneio"): t.get("TorneioID") for t in torneios_abertos}
+        nome_torneio = st.selectbox(
+            "Torneio",
+            options=list(mapa.keys()),
+            key="v58_torneio_inscricao",
+        )
+        tid = mapa[nome_torneio]
+        torneio = _torneio_por_id_v58(tid)
+
+        cvs_permitidos = []
+        for cv in str(torneio.get("CVsPermitidos", "")).split(","):
+          try:
+            cvs_permitidos.append(int(cv.strip()))
+          except Exception:
+            pass
+
+        with st.form("v58_form_participante", clear_on_submit=True):
+          c1, c2 = st.columns(2)
+          with c1:
+            nome = st.text_input("Nome do participante")
+            tag = st.text_input("PlayerTag (opcional)", placeholder="#ABC123")
+          with c2:
+            cv = st.selectbox(
+                "Centro de Vila",
+                options=cvs_permitidos or list(range(8, 19)),
+                format_func=lambda x: f"CV {x}",
+            )
+            seed = st.number_input(
+                "Seed (opcional)",
+                min_value=0,
+                max_value=999,
+                value=0,
+                step=1,
+                help="Use 0 para sorteio normal. Seeds positivos têm prioridade de ordenação.",
+            )
+
+          obs = st.text_input("Observação (opcional)")
+          add = st.form_submit_button("➕ Inscrever participante", use_container_width=True)
+          if add:
+            try:
+              adicionar_participante_v58(
+                  tid,
+                  nome,
+                  tag,
+                  cv,
+                  seed if int(seed) > 0 else "",
+                  obs,
+              )
+              st.success("✅ Participante inscrito.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+
+        participantes = _participantes_do_torneio_v58(tid)
+        if participantes:
+          st.markdown("#### 👥 Inscritos")
+          df_p = pd.DataFrame(participantes)
+          exibir = [
+              c for c in ["Nome", "PlayerTag", "CentroVila", "Seed", "Status"]
+              if c in df_p.columns
+          ]
+          st.dataframe(df_p[exibir], use_container_width=True, hide_index=True)
+
+          remover_map = {
+              f"{p.get('Nome')} — CV {p.get('CentroVila')}": p.get("ParticipanteID")
+              for p in participantes
+          }
+          remover_nome = st.selectbox(
+              "Remover inscrição",
+              options=["—"] + list(remover_map.keys()),
+              key="v58_remover_participante",
+          )
+          if remover_nome != "—" and st.button(
+              "🗑️ Remover participante",
+              key="v58_btn_remover_participante",
+          ):
+            remover_participante_v58(remover_map[remover_nome])
+            st.success("Participante removido.")
+            st.rerun()
+
+    with tab_chave:
+      torneios_chave = obter_torneios_v58()
+      if not torneios_chave:
+        st.info("Nenhum torneio disponível.")
+      else:
+        mapa = {
+            f"{t.get('Nome')} — {t.get('Status')}": t.get("TorneioID")
+            for t in torneios_chave
+        }
+        escolha = st.selectbox(
+            "Torneio para chaveamento",
+            options=list(mapa.keys()),
+            key="v58_torneio_chave",
+        )
+        tid = mapa[escolha]
+        torneio = _torneio_por_id_v58(tid)
+        participantes = _participantes_do_torneio_v58(tid)
+        partidas = _partidas_do_torneio_v58(tid)
+
+        c1, c2 = st.columns(2)
+        c1.metric("Participantes", len(participantes))
+        c2.metric("Status", torneio.get("Status", "-"))
+
+        if not partidas:
+          st.warning(
+              "Ao gerar o chaveamento, as inscrições são consideradas encerradas. "
+              "O sorteio utiliza seeds quando definidos e cria BYEs automaticamente."
+          )
+          confirmar = st.checkbox(
+              "Confirmo que as inscrições estão corretas",
+              key=f"v58_confirmar_chave_{tid}",
+          )
+          if st.button(
+              "🎲 Gerar chaveamento 1x1",
+              type="primary",
+              use_container_width=True,
+              disabled=not confirmar,
+              key=f"v58_gerar_chave_{tid}",
+          ):
+            try:
+              exigir_backup_automatico(
+                  f"Gerar chaveamento {tid}",
+                  [
+                      ("Torneios", sheet_torneios),
+                      ("TorneioParticipantes", sheet_torneio_participantes),
+                      ("TorneioPartidas", sheet_torneio_partidas),
+                  ],
+              )
+              gerar_chaveamento_v58(tid)
+              registrar_log(
+                  st.session_state.get("admin_logado", "sistema"),
+                  f"Gerou chaveamento do torneio {tid}",
+              )
+              st.success("✅ Chaveamento criado.")
+              st.rerun()
+            except Exception as exc:
+              st.error(str(exc))
+        else:
+          _renderizar_chaveamento_visual_v58(tid)
+
+          st.divider()
+          st.markdown("### ✅ Definir vencedor das partidas")
+
+          pendentes = [
+              p for p in _partidas_do_torneio_v58(tid)
+              if not str(p.get("VencedorID", "") or "").strip()
+              and str(p.get("P1ID", "") or "").strip()
+              and str(p.get("P2ID", "") or "").strip()
+          ]
+
+          if not pendentes:
+            if str(torneio.get("Status", "")).upper() == "FINALIZADO":
+              st.success("🏆 Torneio finalizado.")
+            else:
+              st.info("Nenhuma partida pendente nesta fase.")
+          else:
+            for p in pendentes:
+              partida_id = str(p.get("PartidaID", ""))
+              p1_id = str(p.get("P1ID", ""))
+              p1_nome = str(p.get("P1Nome", ""))
+              p2_id = str(p.get("P2ID", ""))
+              p2_nome = str(p.get("P2Nome", ""))
+
+              st.markdown(
+                  f"**{p.get('Fase','')} — Partida {p.get('Ordem','')}**  \n"
+                  f"{p1_nome} ⚔️ {p2_nome}"
+              )
+
+              vencedor = st.radio(
+                  "Vencedor",
+                  options=[p1_id, p2_id],
+                  format_func=lambda pid, a=p1_id, an=p1_nome, bn=p2_nome: an if pid == a else bn,
+                  horizontal=True,
+                  key=f"v58_vencedor_{partida_id}",
+              )
+
+              if st.button(
+                  "🏅 Confirmar vencedor",
+                  key=f"v58_confirmar_vencedor_{partida_id}",
+              ):
+                try:
+                  exigir_backup_automatico(
+                      f"Definir vencedor {partida_id}",
+                      [
+                          ("Torneios", sheet_torneios),
+                          ("TorneioParticipantes", sheet_torneio_participantes),
+                          ("TorneioPartidas", sheet_torneio_partidas),
+                      ],
+                  )
+                  definir_vencedor_partida_v58(partida_id, vencedor)
+                  registrar_log(
+                      st.session_state.get("admin_logado", "sistema"),
+                      f"Definiu vencedor da partida {partida_id}",
+                  )
+                  st.success("✅ Vencedor confirmado. Chaveamento atualizado.")
+                  st.rerun()
+                except Exception as exc:
+                  st.error(str(exc))
+
+    with tab_publicacao:
+      torneios_admin = obter_torneios_v58()
+      if not torneios_admin:
+        st.info("Nenhum torneio criado.")
+      else:
+        mapa = {t.get("Nome", "Torneio"): t.get("TorneioID") for t in torneios_admin}
+        nome_t = st.selectbox(
+            "Torneio",
+            options=list(mapa.keys()),
+            key="v58_torneio_publicacao",
+        )
+        tid = mapa[nome_t]
+        torneio = _torneio_por_id_v58(tid)
+
+        publico_atual = str(torneio.get("Visibilidade", "")).upper() == "PUBLICO"
+        novo_publico = st.toggle(
+            "🌐 Liberar página deste torneio para usuários comuns",
+            value=publico_atual,
+            key=f"v58_visibilidade_{tid}",
+        )
+
+        if novo_publico != publico_atual:
+          definir_visibilidade_torneio_v58(tid, novo_publico)
+          st.success(
+              "✅ Torneio liberado para os membros."
+              if novo_publico else
+              "🔒 Torneio ocultado dos usuários comuns."
+          )
+          st.rerun()
+
+        youtube = st.text_input(
+            "📺 Link do YouTube / transmissão",
+            value=str(torneio.get("YoutubeURL", "") or ""),
+            key=f"v58_youtube_{tid}",
+        )
+        observacoes = st.text_area(
+            "Informações públicas / observações",
+            value=str(torneio.get("Observacoes", "") or ""),
+            key=f"v58_obs_{tid}",
+        )
+
+        if st.button(
+            "💾 Salvar informações",
+            use_container_width=True,
+            key=f"v58_salvar_publicacao_{tid}",
+        ):
+          atualizar_dados_torneio_v58(tid, youtube, observacoes)
+          st.success("✅ Informações atualizadas.")
+          st.rerun()
+
+  else:
+    # Visualização pública: somente torneios liberados, sem qualquer escrita.
+    publicos = _torneios_publicos_v58()
+    mapa = {
+        f"{t.get('Nome','Torneio')} — {t.get('Status','')}": t.get("TorneioID")
+        for t in publicos
+    }
+    escolha = st.selectbox(
+        "🏟️ Torneio",
+        options=list(mapa.keys()),
+        key="v58_torneio_publico",
+    )
+    tid = mapa[escolha]
+    torneio = _torneio_por_id_v58(tid)
+    participantes = _participantes_do_torneio_v58(tid)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Inscritos", len(participantes))
+    c2.metric("Status", torneio.get("Status", "-"))
+    c3.metric("Formato", torneio.get("Formato", "1x1"))
+
+    if str(torneio.get("Descricao", "")).strip():
+      st.write(torneio.get("Descricao"))
+
+    st.markdown(f"**CVs permitidos:** {torneio.get('CVsPermitidos','-')}")
+
+    if str(torneio.get("YoutubeURL", "")).strip():
+      st.markdown(f"📺 **Transmissão:** {torneio.get('YoutubeURL')}")
+
+    if str(torneio.get("Observacoes", "")).strip():
+      st.info(str(torneio.get("Observacoes")))
+
+    if participantes:
+      with st.expander("👥 Participantes inscritos"):
+        df_p = pd.DataFrame(participantes)
+        cols = [c for c in ["Nome", "CentroVila", "Status"] if c in df_p.columns]
+        st.dataframe(df_p[cols], use_container_width=True, hide_index=True)
+
+    _renderizar_chaveamento_visual_v58(tid)
 
 
 def renderizar_gestao_20(df_rank, colunas_guerras, colunas_liga, colunas_raides):
@@ -6377,9 +7700,30 @@ else:
   # ABAS DESTACADAS DA PÁGINA PRINCIPAL
   st.write("")
 
-  tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_admin = st.tabs(
-      ["🏆 Ranking ao Vivo", "📋 Tabela Detalhada", "👤 Meu Perfil", "📅 Agenda", "🔐 Painel Admin"]
-  )
+  mostrar_torneios_v58 = torneios_visiveis_para_usuario_v58()
+
+  if mostrar_torneios_v58:
+    tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_torneios, tab_admin = st.tabs(
+        [
+            "🏆 Ranking ao Vivo",
+            "📋 Tabela Detalhada",
+            "👤 Meu Perfil",
+            "📅 Agenda",
+            "⚔️ Torneios",
+            "🔐 Painel Admin",
+        ]
+    )
+  else:
+    tab_ranking, tab_tabela, tab_perfil, tab_agenda, tab_admin = st.tabs(
+        [
+            "🏆 Ranking ao Vivo",
+            "📋 Tabela Detalhada",
+            "👤 Meu Perfil",
+            "📅 Agenda",
+            "🔐 Painel Admin",
+        ]
+    )
+    tab_torneios = None
 
   # ABA 1: RANKING AO VIVO
   with tab_ranking:
@@ -6812,6 +8156,11 @@ else:
     renderizar_agenda_membros()
 
   # ABA 5: ÁREA ADMIN
+  # PÁGINA DE TORNEIOS — ADMIN OU LIBERADA AO PÚBLICO
+  if tab_torneios is not None:
+    with tab_torneios:
+      renderizar_torneios_v58()
+
   with tab_admin:
     st.subheader("🔐 Painel de Controle e Administração")
 
