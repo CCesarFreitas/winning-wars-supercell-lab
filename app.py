@@ -80,6 +80,100 @@ try:
 
 except Exception as e:
     st.error(f"Não foi possível descobrir o IP: {e}")
+
+from urllib.parse import quote
+
+def supercell_headers():
+    token = str(
+        st.secrets.get("supercell_api_token", "")
+    ).strip()
+
+    if not token:
+        raise RuntimeError(
+            "O Secret 'supercell_api_token' não foi configurado."
+        )
+
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def consultar_cla_supercell():
+    clan_tag = str(
+        st.secrets.get("supercell_clan_tag", "")
+    ).strip()
+
+    if not clan_tag:
+        raise RuntimeError(
+            "O Secret 'supercell_clan_tag' não foi configurado."
+        )
+
+    tag_codificada = quote(clan_tag, safe="")
+
+    url = (
+        "https://api.clashofclans.com/v1/clans/"
+        f"{tag_codificada}"
+    )
+
+    resposta = requests.get(
+        url,
+        headers=supercell_headers(),
+        timeout=20,
+    )
+
+    if resposta.status_code != 200:
+        raise RuntimeError(
+            f"Supercell retornou HTTP {resposta.status_code}: "
+            f"{resposta.text}"
+        )
+
+    return resposta.json()
+
+
+st.markdown("### 🧪 Teste da API Supercell")
+
+if st.button("🔄 Testar conexão com a Supercell"):
+    try:
+        dados_cla = consultar_cla_supercell()
+
+        st.success("✅ Conexão com a API da Supercell realizada com sucesso!")
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Clã",
+            dados_cla.get("name", "-")
+        )
+
+        col2.metric(
+            "Nível",
+            dados_cla.get("clanLevel", "-")
+        )
+
+        col3.metric(
+            "Membros",
+            dados_cla.get("members", "-")
+        )
+
+        st.write(
+            "**Tag:**",
+            dados_cla.get("tag", "-")
+        )
+
+        st.write(
+            "**Pontos do clã:**",
+            dados_cla.get("clanPoints", "-")
+        )
+
+        st.write(
+            "**Liga:**",
+            dados_cla.get("warLeague", {}).get("name", "-")
+        )
+
+    except Exception as e:
+        st.error("❌ Falha na comunicação com a Supercell.")
+        st.exception(e)
 # --- PWA / ÍCONE PARA IPHONE, IPAD E ANDROID ---
 # O favicon continua configurado em st.set_page_config.
 # Para instalação na Tela de Início, reforçamos apple-touch-icon,
