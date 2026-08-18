@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v59 HOMOLOGAÇÃO - Arena independente, sorteios por fase e repescagem para inscrições ímpares.
+# Winning Wars v60 HOMOLOGAÇÃO - torneios ativos/arquivados separados e chave visual Lado A x Lado B.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -654,6 +654,44 @@ def conectar_banco():
             "DataAtualizacao", "Observacao", "Origem"
         ])
 
+    try:
+        sheet_torneios_arquivo = spreadsheet.worksheet("TorneiosArquivo")
+    except gspread.WorksheetNotFound:
+        sheet_torneios_arquivo = spreadsheet.add_worksheet(
+            title="TorneiosArquivo", rows="3000", cols="15"
+        )
+        sheet_torneios_arquivo.append_row([
+            "TorneioID", "Nome", "Descricao", "Status", "Visibilidade",
+            "CVsPermitidos", "Formato", "DataCriacao", "CriadoPor",
+            "CampeaoID", "CampeaoNome", "YoutubeURL", "Observacoes",
+            "AtualizadoEm", "ArquivadoEm"
+        ])
+
+    try:
+        sheet_torneio_participantes_arquivo = spreadsheet.worksheet("TorneioParticipantesArquivo")
+    except gspread.WorksheetNotFound:
+        sheet_torneio_participantes_arquivo = spreadsheet.add_worksheet(
+            title="TorneioParticipantesArquivo", rows="10000", cols="10"
+        )
+        sheet_torneio_participantes_arquivo.append_row([
+            "TorneioID", "ParticipanteID", "Nome", "PlayerTag",
+            "CentroVila", "Seed", "Status", "DataInscricao",
+            "Observacao", "ArquivadoEm"
+        ])
+
+    try:
+        sheet_torneio_partidas_arquivo = spreadsheet.worksheet("TorneioPartidasArquivo")
+    except gspread.WorksheetNotFound:
+        sheet_torneio_partidas_arquivo = spreadsheet.add_worksheet(
+            title="TorneioPartidasArquivo", rows="20000", cols="16"
+        )
+        sheet_torneio_partidas_arquivo.append_row([
+            "TorneioID", "PartidaID", "Rodada", "Fase", "Ordem",
+            "P1ID", "P1Nome", "P2ID", "P2Nome",
+            "VencedorID", "VencedorNome", "Status",
+            "DataAtualizacao", "Observacao", "Origem", "ArquivadoEm"
+        ])
+
     return (
         sheet_dados,
         sheet_admins,
@@ -673,6 +711,9 @@ def conectar_banco():
         sheet_torneios,
         sheet_torneio_participantes,
         sheet_torneio_partidas,
+        sheet_torneios_arquivo,
+        sheet_torneio_participantes_arquivo,
+        sheet_torneio_partidas_arquivo,
     )
 
 
@@ -696,6 +737,9 @@ try:
         sheet_torneios,
         sheet_torneio_participantes,
         sheet_torneio_partidas,
+        sheet_torneios_arquivo,
+        sheet_torneio_participantes_arquivo,
+        sheet_torneio_partidas_arquivo,
     ) = conectar_banco()
 
 except Exception as e:
@@ -3419,7 +3463,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v59)
+# SUPERCELL API - HOMOLOGAÇÃO (v60)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -7574,6 +7618,9 @@ def _torneio_v59_avancar_chave(tid):
     )
     _torneio_v59_status_participante(cid, "CAMPEAO")
     _torneio_v59_limpar_cache()
+
+    # v60: torneio finalizado deixa imediatamente a área ativa.
+    arquivar_torneio_v60(tid)
     return
 
   proxima = rodada + 1
@@ -7735,6 +7782,340 @@ def _torneio_v59_css():
   )
 
 
+
+# =============================================================================
+# TORNEIOS v60 — arquivo automático + chave visual Lado A / Lado B
+# =============================================================================
+
+@st.cache_data(ttl=20, show_spinner=False)
+def obter_torneios_arquivo_v60():
+  try:
+    return sheet_torneios_arquivo.get_all_records()
+  except Exception:
+    return []
+
+
+def obter_torneios_ativos_v60():
+  """Retorna somente torneios realmente ativos; finalizados/arquivados não poluem a Arena."""
+  return [
+      t for t in obter_torneios_v58()
+      if str(t.get("Status", "") or "").strip().upper()
+      not in {"FINALIZADO", "ARQUIVADO"}
+  ]
+
+
+def _deletar_linhas_torneio_v60(sheet, torneio_id):
+  valores = sheet.get_all_values()
+  if len(valores) < 2:
+    return
+
+  headers = valores[0]
+  if "TorneioID" not in headers:
+    return
+
+  idx = headers.index("TorneioID")
+  linhas = []
+  for i, linha in enumerate(valores[1:], start=2):
+    if idx < len(linha) and str(linha[idx]).strip() == str(torneio_id).strip():
+      linhas.append(i)
+
+  for numero in sorted(linhas, reverse=True):
+    sheet.delete_rows(numero)
+
+
+def arquivar_torneio_v60(torneio_id):
+  """Move torneio finalizado e todo seu histórico das planilhas ativas para o arquivo."""
+  torneio = _torneio_por_id_v58(torneio_id)
+  if not torneio:
+    # Pode já estar arquivado.
+    return False
+
+  status = str(torneio.get("Status", "") or "").strip().upper()
+  if status != "FINALIZADO":
+    raise RuntimeError("Somente torneios FINALIZADOS podem ser arquivados.")
+
+  # Idempotência do arquivo.
+  if any(
+      str(t.get("TorneioID", "") or "").strip() == str(torneio_id).strip()
+      for t in obter_torneios_arquivo_v60()
+  ):
+    _deletar_linhas_torneio_v60(sheet_torneio_partidas, torneio_id)
+    _deletar_linhas_torneio_v60(sheet_torneio_participantes, torneio_id)
+    _deletar_linhas_torneio_v60(sheet_torneios, torneio_id)
+    _torneio_v59_limpar_cache()
+    return True
+
+  agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  participantes = _torneio_v59_participantes(torneio_id)
+  partidas = _torneio_v59_partidas(torneio_id)
+
+  exigir_backup_automatico(
+      f"Arquivamento automático do torneio {torneio_id}",
+      [
+          ("Torneios", sheet_torneios),
+          ("TorneioParticipantes", sheet_torneio_participantes),
+          ("TorneioPartidas", sheet_torneio_partidas),
+          ("TorneiosArquivo", sheet_torneios_arquivo),
+          ("TorneioParticipantesArquivo", sheet_torneio_participantes_arquivo),
+          ("TorneioPartidasArquivo", sheet_torneio_partidas_arquivo),
+      ],
+  )
+
+  sheet_torneios_arquivo.append_row([
+      torneio.get("TorneioID", ""),
+      torneio.get("Nome", ""),
+      torneio.get("Descricao", ""),
+      "FINALIZADO",
+      torneio.get("Visibilidade", ""),
+      torneio.get("CVsPermitidos", ""),
+      torneio.get("Formato", ""),
+      torneio.get("DataCriacao", ""),
+      torneio.get("CriadoPor", ""),
+      torneio.get("CampeaoID", ""),
+      torneio.get("CampeaoNome", ""),
+      torneio.get("YoutubeURL", ""),
+      torneio.get("Observacoes", ""),
+      torneio.get("AtualizadoEm", ""),
+      agora,
+  ], value_input_option="USER_ENTERED")
+
+  if participantes:
+    linhas_p = []
+    for p in participantes:
+      linhas_p.append([
+          p.get("TorneioID", ""),
+          p.get("ParticipanteID", ""),
+          p.get("Nome", ""),
+          p.get("PlayerTag", ""),
+          p.get("CentroVila", ""),
+          p.get("Seed", ""),
+          p.get("Status", ""),
+          p.get("DataInscricao", ""),
+          p.get("Observacao", ""),
+          agora,
+      ])
+    sheet_torneio_participantes_arquivo.append_rows(
+        linhas_p,
+        value_input_option="USER_ENTERED",
+    )
+
+  if partidas:
+    linhas_m = []
+    for p in partidas:
+      linhas_m.append([
+          p.get("TorneioID", ""),
+          p.get("PartidaID", ""),
+          p.get("Rodada", ""),
+          p.get("Fase", ""),
+          p.get("Ordem", ""),
+          p.get("P1ID", ""),
+          p.get("P1Nome", ""),
+          p.get("P2ID", ""),
+          p.get("P2Nome", ""),
+          p.get("VencedorID", ""),
+          p.get("VencedorNome", ""),
+          p.get("Status", ""),
+          p.get("DataAtualizacao", ""),
+          p.get("Observacao", ""),
+          p.get("Origem", ""),
+          agora,
+      ])
+    sheet_torneio_partidas_arquivo.append_rows(
+        linhas_m,
+        value_input_option="USER_ENTERED",
+    )
+
+  # Somente depois da cópia integral removemos da área ativa.
+  _deletar_linhas_torneio_v60(sheet_torneio_partidas, torneio_id)
+  _deletar_linhas_torneio_v60(sheet_torneio_participantes, torneio_id)
+  _deletar_linhas_torneio_v60(sheet_torneios, torneio_id)
+
+  _torneio_v59_limpar_cache()
+  obter_torneios_arquivo_v60.clear()
+
+  registrar_log(
+      st.session_state.get("admin_logado", "sistema"),
+      f"Arquivou torneio finalizado {torneio_id}",
+  )
+  return True
+
+
+def arquivar_finalizados_antigos_v60():
+  """Migra automaticamente finalizados deixados pelas versões anteriores."""
+  finalizados = [
+      t for t in obter_torneios_v58()
+      if str(t.get("Status", "") or "").strip().upper() == "FINALIZADO"
+  ]
+  arquivados = 0
+  for t in finalizados:
+    try:
+      if arquivar_torneio_v60(str(t.get("TorneioID", "") or "")):
+        arquivados += 1
+    except Exception:
+      # Não impede a Arena de abrir; o erro fica disponível no log.
+      registrar_log(
+          st.session_state.get("admin_logado", "sistema"),
+          f"Falha ao arquivar torneio antigo {t.get('TorneioID','')}",
+      )
+  return arquivados
+
+
+def _card_partida_v60(p):
+  vencedor = str(p.get("VencedorNome", "") or "").strip()
+  footer = (
+      f'<div style="color:#86efac;font-weight:950;margin-top:4px">🏅 {vencedor}</div>'
+      if vencedor else
+      f'<div style="color:#94a3b8;font-size:.78rem;margin-top:4px">Status: {p.get("Status","")}</div>'
+  )
+  return f"""
+  <div class="ww-match59">
+    <div style="color:#facc15;font-size:.72rem;font-weight:900">
+      CONFRONTO {p.get("Ordem","")}
+    </div>
+    <div style="font-weight:850;color:#f8fafc;padding:5px 0">🛡️ {p.get("P1Nome","BYE")}</div>
+    <div style="font-size:.72rem;color:#64748b;font-weight:900">VS</div>
+    <div style="font-weight:850;color:#f8fafc;padding:5px 0">⚔️ {p.get("P2Nome","BYE")}</div>
+    {footer}
+  </div>
+  """
+
+
+def _torneio_v60_render_chave(tid):
+  """Chave principal em dois lados que convergem até a Final."""
+  torneio = _torneio_por_id_v58(tid)
+  partidas = _torneio_v59_partidas(tid)
+  participantes = _torneio_v59_participantes(tid)
+
+  esperando = [
+      p for p in participantes
+      if str(p.get("Status", "")).upper() == "AGUARDANDO_REPESCAGEM"
+  ]
+  if esperando:
+    st.markdown(
+        f"""
+        <div class="ww-wait59">
+          ⏳ <b>{esperando[0].get("Nome","")}</b> aguarda o campeão da repescagem
+          para disputar a última vaga da próxima etapa.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+  if not partidas:
+    st.info("O sorteio ainda não foi realizado.")
+    return
+
+  preliminares = [
+      p for p in partidas
+      if str(p.get("Origem", "")).upper() != "CHAVE_PRINCIPAL"
+  ]
+  chave = [
+      p for p in partidas
+      if str(p.get("Origem", "")).upper() == "CHAVE_PRINCIPAL"
+  ]
+
+  # Eliminatórias e repescagem ficam acima da chave principal.
+  if preliminares:
+    fases = []
+    for p in preliminares:
+      chave_fase = (
+          str(p.get("Fase", "")),
+          int(float(p.get("Rodada", 0) or 0)),
+      )
+      if chave_fase not in fases:
+        fases.append(chave_fase)
+
+    for fase, rodada in fases:
+      grupo = [
+          p for p in preliminares
+          if str(p.get("Fase", "")) == fase
+          and int(float(p.get("Rodada", 0) or 0)) == rodada
+      ]
+      st.markdown(
+          f'<div class="ww-stage59">{fase}</div>',
+          unsafe_allow_html=True,
+      )
+      cols = st.columns(min(3, max(1, len(grupo))))
+      for idx, p in enumerate(grupo):
+        with cols[idx % len(cols)]:
+          st.markdown(_card_partida_v60(p), unsafe_allow_html=True)
+
+  if chave:
+    st.markdown(
+        '<div class="ww-stage59">🏟️ Chave Principal</div>',
+        unsafe_allow_html=True,
+    )
+
+    rodadas = sorted(
+        set(int(float(p.get("Rodada", 0) or 0)) for p in chave)
+    )
+
+    for rodada in rodadas:
+      grupo = sorted(
+          [
+              p for p in chave
+              if int(float(p.get("Rodada", 0) or 0)) == rodada
+          ],
+          key=lambda x: int(float(x.get("Ordem", 0) or 0)),
+      )
+      if not grupo:
+        continue
+
+      fase = str(grupo[0].get("Fase", ""))
+      st.markdown(f"### {fase}")
+
+      # Final central.
+      if len(grupo) == 1:
+        centro1, centro2, centro3 = st.columns([1.2, 1.6, 1.2])
+        with centro2:
+          st.markdown("#### 🏆 FINAL")
+          st.markdown(_card_partida_v60(grupo[0]), unsafe_allow_html=True)
+        continue
+
+      metade = len(grupo) // 2
+      lado_a = grupo[:metade]
+      lado_b = grupo[metade:]
+
+      ca, meio, cb = st.columns([1, 0.12, 1])
+
+      with ca:
+        st.markdown("#### 🔵 LADO A")
+        for p in lado_a:
+          st.markdown(_card_partida_v60(p), unsafe_allow_html=True)
+
+      with meio:
+        st.markdown(
+            """
+            <div style="
+              height:100%;min-height:120px;
+              display:flex;align-items:center;justify-content:center;
+              color:#facc15;font-size:1.6rem;font-weight:950;">
+              ➜
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+      with cb:
+        st.markdown("#### 🔴 LADO B")
+        for p in lado_b:
+          st.markdown(_card_partida_v60(p), unsafe_allow_html=True)
+
+  if torneio and str(torneio.get("Status", "")).upper() == "FINALIZADO":
+    st.markdown(
+        f"""
+        <div class="ww-champ59">
+          <div style="font-size:2.8rem">🏆</div>
+          <div style="color:#facc15;font-weight:950">CAMPEÃO</div>
+          <div style="font-size:2.05rem;font-weight:950;color:white">
+            {torneio.get("CampeaoNome","")}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _torneio_v59_render_chave(tid):
   torneio = _torneio_por_id_v58(tid)
   partidas = _torneio_v59_partidas(tid)
@@ -7874,7 +8255,7 @@ def _torneio_v59_controles_resultado(tid):
         st.rerun()
 
 
-def renderizar_torneios_v59():
+def renderizar_torneios_v60():
   _torneio_v59_css()
   admin = "admin_logado" in st.session_state
 
@@ -7896,7 +8277,7 @@ def renderizar_torneios_v59():
       unsafe_allow_html=True,
   )
 
-  torneios = obter_torneios_v58()
+  torneios = obter_torneios_ativos_v60()
   if not admin:
     torneios = [
         t for t in torneios
@@ -7908,18 +8289,31 @@ def renderizar_torneios_v59():
     return
 
   if admin:
-    tab_arena, tab_criar, tab_insc, tab_sorteio, tab_pub = st.tabs([
+    arquivados_antigos = arquivar_finalizados_antigos_v60()
+    if arquivados_antigos:
+      st.success(
+          f"📦 {arquivados_antigos} torneio(s) finalizado(s) antigo(s) foram arquivados automaticamente."
+      )
+
+    tab_arena, tab_criar, tab_insc, tab_sorteio, tab_pub, tab_arquivo = st.tabs([
         "🏟️ Arena",
-        "✨ Criar",
+        "⚡ Novo Torneio",
         "📝 Inscrições",
         "🎲 Sorteios & Resultados",
         "📡 Publicação",
+        "📦 Arquivo",
     ])
 
     with tab_criar:
       with st.form("v59_create_t", clear_on_submit=True):
-        nome = st.text_input("Nome do torneio")
-        descricao = st.text_area("Descrição / regras / premiação")
+        nome = st.text_input(
+            "Nome do torneio",
+            placeholder="Ex.: Copa Winning Wars — Agosto"
+        )
+        descricao = st.text_area(
+            "Descrição / regras / premiação",
+            placeholder="Opcional — pode ser preenchido depois."
+        )
         cvs = st.multiselect(
             "Centros de Vila permitidos",
             list(range(8, 19)),
@@ -7939,7 +8333,7 @@ def renderizar_torneios_v59():
 
     with tab_insc:
       abertos = [
-          t for t in obter_torneios_v58()
+          t for t in obter_torneios_ativos_v60()
           if str(t.get("Status", "")).upper() in {"INSCRICOES", "RASCUNHO"}
       ]
       if not abertos:
@@ -7987,7 +8381,7 @@ def renderizar_torneios_v59():
           st.dataframe(dfp[cols], use_container_width=True, hide_index=True)
 
     with tab_sorteio:
-      todos = obter_torneios_v58()
+      todos = obter_torneios_ativos_v60()
       if not todos:
         st.info("Nenhum torneio criado.")
       else:
@@ -8014,7 +8408,7 @@ def renderizar_torneios_v59():
             "novo sorteio das Oitavas → Quartas, Semi e Final seguem a chave fixa."
         )
 
-        _torneio_v59_render_chave(tid)
+        _torneio_v60_render_chave(tid)
 
         possui_chave = any(
             str(p.get("Origem", "")).upper() == "CHAVE_PRINCIPAL"
@@ -8084,7 +8478,7 @@ def renderizar_torneios_v59():
         _torneio_v59_controles_resultado(tid)
 
     with tab_arena:
-      todos = obter_torneios_v58()
+      todos = obter_torneios_ativos_v60()
       if not todos:
         st.info("Nenhum torneio criado.")
       else:
@@ -8106,10 +8500,10 @@ def renderizar_torneios_v59():
           st.write(t.get("Descricao"))
         if str(t.get("YoutubeURL", "")).strip():
           st.markdown(f"📺 **Transmissão:** {t.get('YoutubeURL')}")
-        _torneio_v59_render_chave(tid)
+        _torneio_v60_render_chave(tid)
 
     with tab_pub:
-      todos = obter_torneios_v58()
+      todos = obter_torneios_ativos_v60()
       if not todos:
         st.info("Nenhum torneio criado.")
       else:
@@ -8150,9 +8544,32 @@ def renderizar_torneios_v59():
           st.success("Informações salvas.")
           st.rerun()
 
+    with tab_arquivo:
+      st.markdown("### 📦 Torneios arquivados")
+      st.caption(
+          "Torneios finalizados saem automaticamente da Arena ativa e ficam preservados aqui."
+      )
+      historico = obter_torneios_arquivo_v60()
+      if historico:
+        df_arq = pd.DataFrame(historico)
+        cols_arq = [
+            c for c in [
+                "Nome", "CampeaoNome", "CVsPermitidos",
+                "DataCriacao", "AtualizadoEm", "ArquivadoEm"
+            ]
+            if c in df_arq.columns
+        ]
+        st.dataframe(
+            df_arq[cols_arq].iloc[::-1],
+            use_container_width=True,
+            hide_index=True,
+        )
+      else:
+        st.info("Nenhum torneio arquivado ainda.")
+
   else:
     publicos = [
-        t for t in obter_torneios_v58()
+        t for t in obter_torneios_ativos_v60()
         if str(t.get("Visibilidade", "")).upper() == "PUBLICO"
     ]
     mapa = {
@@ -8183,7 +8600,7 @@ def renderizar_torneios_v59():
         cols = [c for c in ["Nome", "CentroVila", "Status"] if c in dfp.columns]
         st.dataframe(dfp[cols], use_container_width=True, hide_index=True)
 
-    _torneio_v59_render_chave(tid)
+    _torneio_v60_render_chave(tid)
 
 
 def renderizar_gestao_20(df_rank, colunas_guerras, colunas_liga, colunas_raides):
@@ -8647,7 +9064,7 @@ elif st.session_state["pagina_atual"] == "torneios":
       )
   )
   if pode_ver_torneios_v59:
-    renderizar_torneios_v59()
+    renderizar_torneios_v60()
   else:
     st.warning("A Arena de Torneios está oculta no momento.")
     if st.button("⬅️ Voltar ao início", key="v59_hidden_back"):
