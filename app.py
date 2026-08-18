@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v52 HOMOLOGAÇÃO - base v51 + prévia de Guerra Normal e Liga via API Supercell.
+# Winning Wars v53 HOMOLOGAÇÃO - base v52 + prévia de Raides da Capital e regras do Passe.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -3304,8 +3304,8 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v52)
-# Gestão dos dois clãs + elegibilidade do Passe + prévia de guerras e Liga. Vastaya não pontua.
+# SUPERCELL API - HOMOLOGAÇÃO (v53)
+# Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
   tag = str(valor or "").strip().upper().replace(" ", "")
@@ -4397,6 +4397,347 @@ def renderizar_previa_guerras_v52():
   )
 
 
+
+def _supercell_parse_timestamp_api(valor):
+  texto = str(valor or "").strip()
+  if not texto:
+    return None
+
+  formatos = (
+      "%Y%m%dT%H%M%S.%fZ",
+      "%Y%m%dT%H%M%SZ",
+      "%Y-%m-%d %H:%M:%S",
+  )
+  for formato in formatos:
+    try:
+      return datetime.strptime(texto, formato)
+    except ValueError:
+      continue
+  return None
+
+
+def _raid_id_e_rotulo_v53(season):
+  """Cria ID técnico pelo período exato e rótulo amigável pelo fim de semana."""
+  inicio_txt = str(season.get("startTime", "") or "")
+  fim_txt = str(season.get("endTime", "") or "")
+
+  inicio = _supercell_parse_timestamp_api(inicio_txt)
+  fim = _supercell_parse_timestamp_api(fim_txt)
+
+  # ID técnico usa os timestamps completos retornados pela API.
+  raid_id = f"{inicio_txt}|{fim_txt}"
+
+  if inicio and fim:
+    # O fechamento costuma ocorrer na segunda-feira; para o rótulo visual,
+    # mostramos o período do fim de semana (até o dia anterior ao fechamento).
+    fim_visual = fim - timedelta(days=1)
+
+    if inicio.month == fim_visual.month and inicio.year == fim_visual.year:
+      rotulo = f"Raide {inicio.day:02d}–{fim_visual.day:02d}/{inicio.month:02d}/{inicio.year}"
+    else:
+      rotulo = (
+          f"Raide {inicio.strftime('%d/%m/%Y')}–"
+          f"{fim_visual.strftime('%d/%m/%Y')}"
+      )
+  else:
+    rotulo = f"Raide {inicio_txt or 'período não identificado'}"
+
+  return raid_id, rotulo
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def consultar_raides_supercell_v53(limit=10):
+  """Consulta temporadas de Raide exclusivamente do clã principal."""
+  clan_tag = _supercell_normalizar_tag(
+      st.secrets.get("supercell_clan_tag", "")
+  )
+  if not clan_tag:
+    raise RuntimeError("O clã principal não está configurado.")
+
+  try:
+    limite = max(1, min(int(limit), 50))
+  except Exception:
+    limite = 10
+
+  endpoint = (
+      f"/clans/{quote(clan_tag, safe='')}/capitalraidseasons"
+      f"?limit={limite}"
+  )
+  dados = _supercell_api_get(endpoint)
+
+  # Trava explícita: esta função nunca consulta o Vastaya.
+  if clan_tag != "#YVLGUJQY":
+    raise RuntimeError(
+        "A prévia de Raides está configurada para aceitar somente o Winning Wars (#YVLGUJQY)."
+    )
+
+  return dados
+
+
+def _mapa_elegibilidade_players_v53():
+  """Lê a situação atual por PlayerTag sem usar nome como identidade."""
+  try:
+    registros = obter_dados_cached()
+  except Exception:
+    registros = []
+
+  mapa = {}
+  for registro in registros or []:
+    tag = _supercell_normalizar_tag(registro.get("PlayerTag", ""))
+    if not tag:
+      continue
+    mapa[tag] = {
+        "NomeBase": str(registro.get("Nome", "") or "").strip(),
+        "StatusClan": str(registro.get("StatusClan", "") or "").strip(),
+        "ElegivelPasse": str(registro.get("ElegivelPasse", "") or "").strip().upper(),
+    }
+  return mapa
+
+
+def calcular_pontos_raide_v53(numero_ataques, bonus_top3=False):
+  try:
+    ataques = max(0, int(numero_ataques))
+  except Exception:
+    ataques = 0
+
+  pontos_base = min(ataques * 2, 12)
+  bonus = 1 if bonus_top3 else 0
+  return pontos_base, bonus, pontos_base + bonus
+
+
+def montar_previa_raide_v53(season):
+  raid_id, rotulo = _raid_id_e_rotulo_v53(season)
+  membros = season.get("members", []) or []
+  elegibilidade = _mapa_elegibilidade_players_v53()
+
+  preparados = []
+  for membro in membros:
+    tag = _supercell_normalizar_tag(membro.get("tag", ""))
+    if not tag:
+      continue
+
+    try:
+      ataques = int(membro.get("attacks", 0) or 0)
+    except Exception:
+      ataques = 0
+
+    try:
+      ouro = int(membro.get("capitalResourcesLooted", 0) or 0)
+    except Exception:
+      ouro = 0
+
+    preparados.append({
+        "PlayerTag": tag,
+        "Jogador": str(membro.get("name", "") or "").strip(),
+        "Ataques": ataques,
+        "Capital Gold": ouro,
+    })
+
+  # Top 3 por Capital Gold: exatamente três posições, salvo se houver menos participantes.
+  ranking_gold = sorted(
+      preparados,
+      key=lambda x: (-x["Capital Gold"], x["PlayerTag"]),
+  )
+  top3_tags = {item["PlayerTag"] for item in ranking_gold[:3]}
+
+  linhas = []
+  for item in preparados:
+    tag = item["PlayerTag"]
+    status = elegibilidade.get(tag, {})
+    elegivel_atual = status.get("ElegivelPasse", "") == "SIM"
+
+    pontos_base, bonus, total = calcular_pontos_raide_v53(
+        item["Ataques"],
+        bonus_top3=(tag in top3_tags),
+    )
+
+    linhas.append({
+        "Raide": rotulo,
+        "RaidID": raid_id,
+        "PlayerTag": tag,
+        "Jogador": item["Jogador"],
+        "Ataques": item["Ataques"],
+        "Capital Gold": item["Capital Gold"],
+        "Top 3": "SIM" if tag in top3_tags else "NAO",
+        "Pontos Base": pontos_base,
+        "Bônus Top 3": bonus,
+        "Pontos Raide": total,
+        "Status Atual": status.get("StatusClan", "Não cadastrado"),
+        "Elegível Passe Atual": "SIM" if elegivel_atual else "NAO",
+        "ClanTagOrigem": "#YVLGUJQY",
+    })
+
+  df_raid = pd.DataFrame(linhas)
+  if not df_raid.empty:
+    df_raid = df_raid.sort_values(
+        ["Pontos Raide", "Capital Gold", "Ataques"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+  meta = {
+      "RaidID": raid_id,
+      "Raide": rotulo,
+      "Estado": str(season.get("state", "") or ""),
+      "Inicio": str(season.get("startTime", "") or ""),
+      "Fim": str(season.get("endTime", "") or ""),
+      "TotalLoot": season.get("capitalTotalLoot", ""),
+      "AtaquesTotais": season.get("totalAttacks", ""),
+      "MedalhasOfensivas": season.get("offensiveReward", ""),
+      "MedalhasDefensivas": season.get("defensiveReward", ""),
+      "Participantes": len(linhas),
+  }
+  return df_raid, meta
+
+
+def montar_catalogo_raides_v53(dados_raides):
+  seasons = dados_raides.get("items", []) or []
+  linhas = []
+
+  for idx, season in enumerate(seasons):
+    raid_id, rotulo = _raid_id_e_rotulo_v53(season)
+    linhas.append({
+        "indice": idx,
+        "Raide": rotulo,
+        "RaidID": raid_id,
+        "Estado": str(season.get("state", "") or ""),
+        "Participantes": len(season.get("members", []) or []),
+        "Capital Gold": season.get("capitalTotalLoot", ""),
+        "Ataques": season.get("totalAttacks", ""),
+    })
+
+  return pd.DataFrame(linhas)
+
+
+def renderizar_previa_raides_v53():
+  st.markdown("#### 5️⃣ Prévia de Raides — Capital do Clã")
+  st.info(
+      "🧪 Somente leitura. A v53 consulta exclusivamente os Raides do "
+      "**Winning Wars #YVLGUJQY**. Raides do Vastaya não entram nesta rotina "
+      "e nenhum ponto é gravado em `Raide_*`."
+  )
+
+  st.markdown(
+      "**Regra do Passe para Raides:** "
+      "`Pontos Base = min(Ataques × 2, 12)` e os **3 maiores Capital Gold** "
+      "do fim de semana recebem **+1 ponto** cada."
+  )
+
+  st.caption(
+      "Cada fim de semana possui um RaidID técnico baseado no período exato retornado "
+      "pela API. Isso permitirá impedir contabilização duplicada quando a gravação "
+      "automática for habilitada."
+  )
+
+  quantidade = st.selectbox(
+      "Quantos fins de semana recentes consultar?",
+      options=[3, 5, 10, 20],
+      index=2,
+      key="v53_qtd_raides",
+  )
+
+  if st.button(
+      "🔎 Ler Raides do Winning Wars",
+      type="primary",
+      use_container_width=True,
+      key="v53_ler_raides",
+  ):
+    try:
+      consultar_raides_supercell_v53.clear()
+      _supercell_api_get.clear()
+
+      with st.spinner("Consultando os fins de semana de Raide..."):
+        dados = consultar_raides_supercell_v53(quantidade)
+        catalogo = montar_catalogo_raides_v53(dados)
+
+      st.session_state["v53_raides_dados"] = dados
+      st.session_state["v53_raides_catalogo"] = catalogo
+      st.success("✅ Raides consultados. Nenhum ponto foi gravado.")
+    except Exception as exc:
+      st.error("❌ Não foi possível consultar os Raides do Winning Wars.")
+      st.exception(exc)
+
+  dados = st.session_state.get("v53_raides_dados")
+  catalogo = st.session_state.get("v53_raides_catalogo")
+
+  if not dados or catalogo is None or catalogo.empty:
+    return
+
+  st.markdown("##### 📅 Fins de semana encontrados")
+  st.dataframe(
+      catalogo.drop(columns=["indice"], errors="ignore"),
+      use_container_width=True,
+      hide_index=True,
+  )
+
+  opcoes = catalogo["Raide"].tolist()
+  escolha = st.selectbox(
+      "Selecione o fim de semana para analisar",
+      options=opcoes,
+      index=0,
+      key="v53_raide_escolhido",
+  )
+
+  linha_catalogo = catalogo[catalogo["Raide"] == escolha].iloc[0]
+  indice = int(linha_catalogo["indice"])
+  season = (dados.get("items", []) or [])[indice]
+
+  df_raid, meta = montar_previa_raide_v53(season)
+
+  r1, r2, r3, r4 = st.columns(4)
+  r1.metric("Raide", meta.get("Raide", "-"))
+  r2.metric("Participantes", meta.get("Participantes", 0))
+  r3.metric("Ataques do clã", meta.get("AtaquesTotais", "-"))
+  r4.metric("Capital Gold", meta.get("TotalLoot", "-"))
+
+  if df_raid.empty:
+    st.warning("Este fim de semana não possui membros/ataques disponíveis na resposta da API.")
+    return
+
+  st.markdown("##### 🏆 Pontuação provisória do fim de semana")
+  st.dataframe(
+      df_raid[[
+          "Jogador",
+          "PlayerTag",
+          "Ataques",
+          "Capital Gold",
+          "Top 3",
+          "Pontos Base",
+          "Bônus Top 3",
+          "Pontos Raide",
+          "Status Atual",
+          "Elegível Passe Atual",
+      ]],
+      use_container_width=True,
+      hide_index=True,
+  )
+
+  top3 = df_raid[df_raid["Top 3"] == "SIM"].sort_values(
+      "Capital Gold", ascending=False
+  )
+
+  if not top3.empty:
+    st.markdown("##### 🥇🥈🥉 Bônus Top 3 — Capital Gold")
+    medalhas = ["🥇", "🥈", "🥉"]
+    for pos, (_, row) in enumerate(top3.iterrows()):
+      if pos >= 3:
+        break
+      st.write(
+          f"{medalhas[pos]} **{row['Jogador']}** — "
+          f"{int(row['Capital Gold']):,} Capital Gold — +1 ponto"
+      )
+
+  with st.expander("🔐 Ver identificadores técnicos do Raide", expanded=False):
+    st.code(f"RaidID: {meta.get('RaidID', '')}")
+    st.write("Início API:", meta.get("Inicio", ""))
+    st.write("Fim API:", meta.get("Fim", ""))
+    st.write("ClanTagOrigem:", "#YVLGUJQY")
+
+  st.caption(
+      "🔒 A v53 não altera `Raide_*`. Depois de validarmos ataques, Capital Gold, "
+      "Top 3 e datas, podemos habilitar a gravação idempotente por RaidID."
+  )
+
+
 def renderizar_integracao_supercell():
   st.markdown("### 🛡️ Integração Supercell")
   st.caption(
@@ -4583,6 +4924,9 @@ def renderizar_integracao_supercell():
 
   st.divider()
   renderizar_previa_guerras_v52()
+
+  st.divider()
+  renderizar_previa_raides_v53()
 
   st.divider()
   st.markdown("#### 📜 Histórico de movimentações")
