@@ -25,7 +25,7 @@ except ImportError:
   ImageOps = None
   PILLOW_DISPONIVEL = False
 
-# Winning Wars v57 HOMOLOGAÇÃO - segurança/idempotência central, anti-duplicidade e validação integral.
+# Winning Wars v58-GUERRA HOMOLOGAÇÃO - nova regra de Guerra Normal: melhor ataque válido, máximo 3 pts e bônus conservador.
 # Não depende de streamlit-quill/streamlit-quill2.
 # Quando Components V2 estiver disponível, usa um editor contenteditable nativo;
 # caso contrário, há fallback para st.text_area sem derrubar o aplicativo.
@@ -3346,7 +3346,7 @@ def renderizar_agenda_membros():
 
 
 # ==============================================================================
-# SUPERCELL API - HOMOLOGAÇÃO (v57)
+# SUPERCELL API - HOMOLOGAÇÃO (v58-GUERRA)
 # Gestão dos dois clãs + guerras/Liga + prévia de Raides. Vastaya não pontua.
 # ==============================================================================
 def _supercell_normalizar_tag(valor: str) -> str:
@@ -4077,7 +4077,7 @@ def _war_member_maps(war_data, clan_tag):
 
 
 def calcular_pontos_ataque_v52(tipo_guerra, cv_atacante, cv_defensor, estrelas):
-  """Regras oficiais definidas para a competição do Passe na homologação."""
+  """Calcula pontos candidatos do ataque. O total da Guerra Normal é definido por jogador."""
   try:
     cv_a = int(cv_atacante)
   except Exception:
@@ -4087,7 +4087,7 @@ def calcular_pontos_ataque_v52(tipo_guerra, cv_atacante, cv_defensor, estrelas):
   except Exception:
     cv_d = 0
   try:
-    stars = int(estrelas)
+    stars = max(0, min(3, int(estrelas)))
   except Exception:
     stars = 0
 
@@ -4095,8 +4095,7 @@ def calcular_pontos_ataque_v52(tipo_guerra, cv_atacante, cv_defensor, estrelas):
   tipo = str(tipo_guerra or "").strip().lower()
 
   if tipo == "liga":
-    # Liga: não há penalidade por atacar abaixo.
-    # Contra CV maior: 2 estrelas valem 3; 3 estrelas valem 4.
+    # Liga permanece com a regra já homologada.
     if diferenca is not None and diferenca >= 1:
       if stars == 2:
         return 3, "⬆️ CV superior: 2⭐ → 3 pts"
@@ -4104,12 +4103,16 @@ def calcular_pontos_ataque_v52(tipo_guerra, cv_atacante, cv_defensor, estrelas):
         return 4, "⬆️ CV superior: 3⭐ → 4 pts"
     return stars, "Liga: estrelas reais"
 
-  # Guerra normal:
-  # mesmo CV ou 1 abaixo contam normalmente;
-  # 2+ CV abaixo não pontuam.
-  if diferenca is not None and diferenca <= -2:
-    return 0, "🚫 Alvo 2+ CV abaixo: não pontua"
-  return stars, "✅ Ataque válido"
+  # Guerra Normal:
+  # Só ataques contra CV igual ou superior são candidatos à pontuação.
+  # O total por jogador NÃO soma os ataques: usa o melhor candidato, máximo 3.
+  if not cv_a or not cv_d:
+    return 0, "⚠️ CV não identificado: ataque não pontua automaticamente"
+
+  if cv_d < cv_a:
+    return 0, "↘️ CV inferior: não entra no critério de pontuação"
+
+  return stars, f"✅ CV igual/superior: {stars}⭐ → {stars} pts candidatos"
 
 
 def montar_ataques_guerra_v52(war_data, tipo_guerra="Normal", war_tag=""):
@@ -4128,7 +4131,8 @@ def montar_ataques_guerra_v52(war_data, tipo_guerra="Normal", war_tag=""):
   start_time = str(war_data.get("startTime", "") or "")
   end_time = str(war_data.get("endTime", "") or "")
   state = str(war_data.get("state", "") or "")
-  tipo_label = "Liga" if str(tipo_guerra).lower() == "liga" else "Guerra Normal"
+  tipo_normalizado = str(tipo_guerra or "").strip().lower()
+  tipo_label = "Liga" if tipo_normalizado == "liga" else "Guerra Normal"
 
   war_id = (
       _supercell_normalizar_tag(war_tag)
@@ -4136,67 +4140,213 @@ def montar_ataques_guerra_v52(war_data, tipo_guerra="Normal", war_tag=""):
       else f"{adversario_tag}|{start_time}"
   )
 
-  linhas = []
+  # ------------------------------------------------------------
+  # Coleta bruta primeiro. Para Guerra Normal precisamos analisar
+  # a sequência global dos ataques antes de classificar bônus.
+  # ------------------------------------------------------------
+  ataques_brutos = []
+  seq_fallback = 0
 
   for atacante_tag, atacante in nossos.items():
     nome_atacante = str(atacante.get("name", "") or "")
-    cv_atacante = atacante.get("townhallLevel", atacante.get("townHallLevel", ""))
-    ataques = atacante.get("attacks", []) or []
+    cv_atacante = atacante.get(
+        "townhallLevel",
+        atacante.get("townHallLevel", ""),
+    )
 
-    for posicao_ataque, ataque in enumerate(ataques, start=1):
-      defensor_tag = _supercell_normalizar_tag(ataque.get("defenderTag", ""))
+    for ataque in (atacante.get("attacks", []) or []):
+      seq_fallback += 1
+      defensor_tag = _supercell_normalizar_tag(
+          ataque.get("defenderTag", "")
+      )
       defensor = inimigos.get(defensor_tag, {})
-      nome_defensor = str(defensor.get("name", "") or "")
-      cv_defensor = defensor.get("townhallLevel", defensor.get("townHallLevel", ""))
-      estrelas = ataque.get("stars", 0)
-      destruicao = ataque.get("destructionPercentage", 0)
 
-      pontos, regra = calcular_pontos_ataque_v52(
-          tipo_guerra,
-          cv_atacante,
-          cv_defensor,
+      ordem_raw = ataque.get("order", None)
+      try:
+        ordem_global = int(ordem_raw)
+        ordem_valida = True
+      except Exception:
+        ordem_global = None
+        ordem_valida = False
+
+      ataques_brutos.append({
+          "atacante_tag": atacante_tag,
+          "nome_atacante": nome_atacante,
+          "cv_atacante": cv_atacante,
+          "defensor_tag": defensor_tag,
+          "nome_defensor": str(defensor.get("name", "") or ""),
+          "cv_defensor": defensor.get(
+              "townhallLevel",
+              defensor.get("townHallLevel", ""),
+          ),
+          "estrelas": ataque.get("stars", 0),
+          "destruicao": ataque.get("destructionPercentage", 0),
+          "ordem_global": ordem_global,
+          "ordem_valida": ordem_valida,
+          "seq_fallback": seq_fallback,
+      })
+
+  # A classificação automática de bônus é conservadora:
+  # só será usada se TODOS os ataques disponíveis trouxerem 'order'.
+  ordem_global_confiavel = bool(ataques_brutos) and all(
+      a["ordem_valida"] for a in ataques_brutos
+  )
+
+  if ordem_global_confiavel:
+    ataques_brutos.sort(
+        key=lambda a: (a["ordem_global"], a["seq_fallback"])
+    )
+  else:
+    # Sem ordem comprovada, mantemos uma ordem estável só para exibição,
+    # mas NUNCA inferimos bônus.
+    ataques_brutos.sort(key=lambda a: a["seq_fallback"])
+
+  # Estado das bases inimigas antes de cada ataque.
+  melhor_estrelas_base = {
+      tag: 0 for tag in inimigos.keys()
+  }
+
+  ataques_por_player = {}
+  criterio_tripla_ja_cumprido = {}
+  linhas = []
+
+  for item in ataques_brutos:
+    atacante_tag = item["atacante_tag"]
+    ataques_por_player[atacante_tag] = (
+        ataques_por_player.get(atacante_tag, 0) + 1
+    )
+    numero_ataque = ataques_por_player[atacante_tag]
+
+    try:
+      cv_a = int(item["cv_atacante"])
+    except Exception:
+      cv_a = 0
+    try:
+      cv_d = int(item["cv_defensor"])
+    except Exception:
+      cv_d = 0
+    try:
+      estrelas = max(0, min(3, int(item["estrelas"])))
+    except Exception:
+      estrelas = 0
+
+    diferenca_cv = (cv_d - cv_a) if cv_a and cv_d else ""
+
+    if diferenca_cv == "":
+      classificacao = "CV não identificado"
+    elif diferenca_cv > 0:
+      classificacao = f"⬆️ +{diferenca_cv} CV"
+    elif diferenca_cv == 0:
+      classificacao = "✅ Mesmo CV"
+    elif diferenca_cv == -1:
+      classificacao = "↘️ 1 CV abaixo"
+    else:
+      classificacao = f"↘️ {abs(diferenca_cv)} CV abaixo"
+
+    # Quantas bases ainda NÃO tinham sido fechadas com 3 estrelas
+    # imediatamente antes deste ataque?
+    bases_abertas_antes = None
+    todas_fechadas_antes = False
+
+    if tipo_normalizado != "liga" and ordem_global_confiavel:
+      bases_abertas_antes = sum(
+          1 for tag in inimigos.keys()
+          if int(melhor_estrelas_base.get(tag, 0) or 0) < 3
+      )
+      todas_fechadas_antes = bases_abertas_antes == 0
+
+    ja_cumpriu_antes = bool(
+        criterio_tripla_ja_cumprido.get(atacante_tag, False)
+    )
+
+    # Bônus = exceção. Só é reconhecido quando comprovado:
+    # 1) é o segundo ataque;
+    # 2) o jogador JÁ tinha 3⭐ em CV igual/superior;
+    # 3) todas as bases estavam fechadas ANTES do ataque;
+    # 4) temos ordem global confiável.
+    ataque_bonus = (
+        tipo_normalizado != "liga"
+        and ordem_global_confiavel
+        and numero_ataque == 2
+        and ja_cumpriu_antes
+        and todas_fechadas_antes
+    )
+
+    pontos_candidatos, regra_base = calcular_pontos_ataque_v52(
+        tipo_guerra,
+        cv_a,
+        cv_d,
+        estrelas,
+    )
+
+    ataque_elegivel = True
+    regra = regra_base
+
+    if tipo_normalizado != "liga":
+      if ataque_bonus:
+        pontos_candidatos = 0
+        ataque_elegivel = False
+        regra = (
+            "🎁 Bônus comprovado: 2º ataque após cumprir 3⭐ em CV igual/superior "
+            "e com todas as bases já fechadas"
+        )
+      elif cv_a and cv_d and cv_d < cv_a:
+        ataque_elegivel = False
+        regra = "↘️ CV inferior: não entra no critério de pontuação"
+      elif not cv_a or not cv_d:
+        ataque_elegivel = False
+        regra = "⚠️ CV não identificado: não pontua automaticamente"
+
+      # Atualiza o requisito individual SOMENTE com ataque normal,
+      # elegível, 3 estrelas, CV igual ou superior.
+      if (
+          not ataque_bonus
+          and ataque_elegivel
+          and estrelas == 3
+          and cv_d >= cv_a
+      ):
+        criterio_tripla_ja_cumprido[atacante_tag] = True
+
+    # A base é atualizada DEPOIS da análise do ataque.
+    if item["defensor_tag"]:
+      melhor_estrelas_base[item["defensor_tag"]] = max(
+          int(melhor_estrelas_base.get(item["defensor_tag"], 0) or 0),
           estrelas,
       )
 
-      try:
-        diferenca_cv = int(cv_defensor) - int(cv_atacante)
-      except Exception:
-        diferenca_cv = ""
-
-      if diferenca_cv == "":
-        classificacao = "CV não identificado"
-      elif diferenca_cv > 0:
-        classificacao = f"⬆️ +{diferenca_cv} CV"
-      elif diferenca_cv == 0:
-        classificacao = "✅ Mesmo CV"
-      elif diferenca_cv == -1:
-        classificacao = "↘️ 1 CV abaixo"
-      else:
-        classificacao = f"🚫 {abs(diferenca_cv)} CV abaixo"
-
-      linhas.append({
-          "Guerra": f"vs {adversario_nome}",
-          "Tipo": tipo_label,
-          "WarID": war_id,
-          "Adversario": adversario_nome,
-          "AdversarioTag": adversario_tag,
-          "Inicio": start_time,
-          "Estado": state,
-          "PlayerTag": atacante_tag,
-          "Atacante": nome_atacante,
-          "CV Atacante": cv_atacante,
-          "Ataque": posicao_ataque,
-          "Defensor": nome_defensor,
-          "DefensorTag": defensor_tag,
-          "CV Defensor": cv_defensor,
-          "Diferença CV": diferenca_cv,
-          "Classificação": classificacao,
-          "Estrelas": estrelas,
-          "Destruição %": destruicao,
-          "Pontos Passe": pontos,
-          "Regra aplicada": regra,
-          "ClanTagOrigem": principal_tag,
-      })
+    linhas.append({
+        "Guerra": f"vs {adversario_nome}",
+        "Tipo": tipo_label,
+        "WarID": war_id,
+        "Adversario": adversario_nome,
+        "AdversarioTag": adversario_tag,
+        "Inicio": start_time,
+        "Estado": state,
+        "PlayerTag": atacante_tag,
+        "Atacante": item["nome_atacante"],
+        "CV Atacante": cv_a or item["cv_atacante"],
+        "Ataque": numero_ataque,
+        "Ordem Global": (
+            item["ordem_global"]
+            if item["ordem_global"] is not None else ""
+        ),
+        "Defensor": item["nome_defensor"],
+        "DefensorTag": item["defensor_tag"],
+        "CV Defensor": cv_d or item["cv_defensor"],
+        "Diferença CV": diferenca_cv,
+        "Classificação": classificacao,
+        "Estrelas": estrelas,
+        "Destruição %": item["destruicao"],
+        "Bases abertas antes": (
+            bases_abertas_antes
+            if bases_abertas_antes is not None else ""
+        ),
+        "Ataque bônus": "SIM" if ataque_bonus else "NÃO",
+        "Elegível pontuação": "SIM" if ataque_elegivel else "NÃO",
+        "Pontos Passe": int(pontos_candidatos),
+        "Regra aplicada": regra,
+        "ClanTagOrigem": principal_tag,
+    })
 
   meta = {
       "adversario_nome": adversario_nome,
@@ -4207,29 +4357,110 @@ def montar_ataques_guerra_v52(war_data, tipo_guerra="Normal", war_tag=""):
       "tipo": tipo_label,
       "war_id": war_id,
       "nossos_ataques": len(linhas),
-      "nosso_nome": str(nosso_cla.get("name", "Winning Wars") or "Winning Wars"),
+      "nosso_nome": str(
+          nosso_cla.get("name", "Winning Wars") or "Winning Wars"
+      ),
+      "ordem_global_confiavel": ordem_global_confiavel,
   }
   return pd.DataFrame(linhas), meta
-
 
 def resumir_pontos_guerra_v52(df_ataques):
   if df_ataques is None or df_ataques.empty:
     return pd.DataFrame()
 
-  resumo = (
-      df_ataques
-      .groupby(["WarID", "Guerra", "Tipo", "PlayerTag", "Atacante"], as_index=False)
-      .agg(
-          Ataques=("Ataque", "count"),
-          Estrelas_Reais=("Estrelas", "sum"),
-          Pontos_Passe=("Pontos Passe", "sum"),
+  linhas = []
+
+  for chaves, grupo in df_ataques.groupby(
+      ["WarID", "Guerra", "Tipo", "PlayerTag", "Atacante"],
+      dropna=False,
+  ):
+    war_id, guerra, tipo, player_tag, atacante = chaves
+
+    estrelas_reais = int(
+        pd.to_numeric(grupo["Estrelas"], errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+    ataques = int(len(grupo))
+
+    pontos_serie = pd.to_numeric(
+        grupo["Pontos Passe"],
+        errors="coerce",
+    ).fillna(0)
+
+    if str(tipo).strip().lower() == "guerra normal":
+      # NOVA REGRA: máximo de 3 pontos por jogador por guerra.
+      # Não soma ataques: considera o melhor ataque normal elegível.
+      pontos_passe = int(min(3, pontos_serie.max() if len(pontos_serie) else 0))
+
+      bonus = int(
+          grupo.get(
+              "Ataque bônus",
+              pd.Series(["NÃO"] * len(grupo), index=grupo.index),
+          )
+          .astype(str)
+          .str.upper()
+          .eq("SIM")
+          .sum()
       )
-  )
+
+      elegiveis = int(
+          grupo.get(
+              "Elegível pontuação",
+              pd.Series(["NÃO"] * len(grupo), index=grupo.index),
+          )
+          .astype(str)
+          .str.upper()
+          .eq("SIM")
+          .sum()
+      )
+
+      if pontos_passe == 3:
+        criterio = "✅ Cumpriu: melhor ataque 3⭐ em CV igual/superior"
+      elif pontos_passe == 2:
+        criterio = "🟡 Melhor ataque válido: 2⭐"
+      elif pontos_passe == 1:
+        criterio = "🟠 Melhor ataque válido: 1⭐"
+      else:
+        criterio = "🔴 Nenhum ataque válido pontuou"
+
+      linhas.append({
+          "WarID": war_id,
+          "Guerra": guerra,
+          "Tipo": tipo,
+          "PlayerTag": player_tag,
+          "Atacante": atacante,
+          "Ataques": ataques,
+          "Estrelas_Reais": estrelas_reais,
+          "Ataques_Elegiveis": elegiveis,
+          "Ataques_Bonus": bonus,
+          "Pontos_Passe": pontos_passe,
+          "Critério": criterio,
+      })
+    else:
+      # Liga: mantém exatamente a soma da regra já homologada.
+      linhas.append({
+          "WarID": war_id,
+          "Guerra": guerra,
+          "Tipo": tipo,
+          "PlayerTag": player_tag,
+          "Atacante": atacante,
+          "Ataques": ataques,
+          "Estrelas_Reais": estrelas_reais,
+          "Ataques_Elegiveis": ataques,
+          "Ataques_Bonus": 0,
+          "Pontos_Passe": int(pontos_serie.sum()),
+          "Critério": "Liga: soma dos pontos calculados por ataque",
+      })
+
+  resumo = pd.DataFrame(linhas)
+  if resumo.empty:
+    return resumo
+
   return resumo.sort_values(
       ["Guerra", "Pontos_Passe", "Estrelas_Reais"],
       ascending=[True, False, False],
   )
-
 
 def buscar_guerras_liga_v52():
   grupo = consultar_grupo_liga_supercell()
@@ -4275,10 +4506,12 @@ def renderizar_previa_guerras_v52():
   regra1, regra2 = st.columns(2)
   with regra1:
     st.markdown(
-        "**⚔️ Guerra Normal**\n\n"
-        "- Mesmo CV: estrelas normais\n"
-        "- 1 CV abaixo: estrelas normais\n"
-        "- 2+ CV abaixo: **0 ponto**"
+        "**⚔️ Guerra Normal — nova regra**\n\n"
+        "- Máximo por jogador/guera: **3 pontos**\n"
+        "- Vale o **melhor ataque normal** contra CV igual ou superior\n"
+        "- 3⭐ = 3 pts · 2⭐ = 2 pts · 1⭐ = 1 pt\n"
+        "- O 2º ataque pode melhorar a pontuação\n"
+        "- Ataque de bônus comprovado é desconsiderado"
     )
   with regra2:
     st.markdown(
@@ -4289,8 +4522,8 @@ def renderizar_previa_guerras_v52():
     )
 
   st.caption(
-      "Todas as estrelas do ataque são consideradas individualmente, mesmo quando "
-      "o alvo já possuía estrelas de ataques anteriores."
+      "Na Guerra Normal os ataques não são somados: o jogador recebe o valor do "
+      "melhor ataque normal elegível, limitado a 3 pontos. A Liga mantém sua regra própria."
   )
 
   normal_tab, liga_tab = st.tabs(["⚔️ Guerra atual", "🏆 Liga de Clãs"])
@@ -4331,12 +4564,24 @@ def renderizar_previa_guerras_v52():
       a3.metric("Adversário", meta.get("adversario_nome", "-"))
 
       if ataques is not None and not ataques.empty:
+        if meta.get("ordem_global_confiavel", False):
+          st.success(
+              "✅ Ordem global dos ataques disponível. "
+              "A verificação de ataque de bônus pode ser feita automaticamente."
+          )
+        else:
+          st.warning(
+              "⚠️ A ordem global dos ataques não pôde ser comprovada nesta resposta. "
+              "Por segurança, nenhum ataque será classificado automaticamente como bônus."
+          )
+
         resumo = resumir_pontos_guerra_v52(ataques)
         st.markdown("##### 📊 Resumo por jogador")
         st.dataframe(
             resumo[[
                 "Atacante", "PlayerTag", "Ataques",
-                "Estrelas_Reais", "Pontos_Passe"
+                "Estrelas_Reais", "Ataques_Elegiveis",
+                "Ataques_Bonus", "Pontos_Passe", "Critério"
             ]],
             use_container_width=True,
             hide_index=True,
@@ -4346,8 +4591,11 @@ def renderizar_previa_guerras_v52():
           st.dataframe(
               ataques[[
                   "Atacante", "PlayerTag", "CV Atacante",
+                  "Ataque", "Ordem Global",
                   "Defensor", "CV Defensor", "Classificação",
-                  "Estrelas", "Destruição %", "Pontos Passe",
+                  "Estrelas", "Destruição %",
+                  "Bases abertas antes", "Ataque bônus",
+                  "Elegível pontuação", "Pontos Passe",
                   "Regra aplicada"
               ]],
               use_container_width=True,
